@@ -188,6 +188,33 @@ test('event-driven wait returns without repeated status queries', async () => {
   } finally { f.cleanup(); }
 });
 
+test('interrupting a wait releases its subscription without cancelling the job', async () => {
+  const f = fixture();
+  try {
+    const token = ensureToken(f.sessionId, f.baseDir);
+    const supervisor = createSupervisor(f);
+    await supervisor.listen();
+    const client = await MailboxClient.connect({ ...f, token });
+    await client.request('register', { job: { jobId: 'keep-running', coordinatorId: 'root', workflowId: 'flow' } });
+    const controller = new AbortController();
+    const waiting = waitForSubagents(client, {
+      coordinatorId: 'root', workflowId: 'flow', jobIds: ['keep-running'], mode: 'all',
+      timeoutMs: 1000, signal: controller.signal,
+    });
+    setTimeout(() => controller.abort(), 30);
+    const result = await waiting;
+    assert.equal(result.interrupted, true);
+    assert.equal(result.timedOut, false);
+    assert.equal((await client.request('job', { jobId: 'keep-running' })).state, 'registered');
+    await client.request('publish', {
+      event: { eventId: 'late-completion', jobId: 'keep-running', eventType: 'terminal', executionState: 'succeeded' },
+    });
+    assert.equal((await client.request('job', { jobId: 'keep-running' })).state, 'succeeded');
+    client.close();
+    await supervisor.close();
+  } finally { f.cleanup(); }
+});
+
 test('a claimed start survives restart without a second execution', async () => {
   const f = fixture();
   let supervisor;

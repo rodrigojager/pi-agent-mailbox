@@ -188,6 +188,9 @@ test('goal all wait stays quiet on partial completion and sends one grouped resu
     for (const handler of handlers.get('agent_settled') ?? []) handler({}, ctx);
     await new Promise(resolve => setTimeout(resolve, 30));
     assert.equal(sent.length, 0);
+    supervisor.publish({ eventId: 'second-progress', jobId: 'second', eventType: 'progress', payload: { activity: 'still running' } });
+    await new Promise(resolve => setTimeout(resolve, 30));
+    assert.equal(sent.length, 0, 'progress during an all-wait must not wake the model');
     supervisor.publish({ eventId: 'second-result', jobId: 'second', eventType: 'terminal', executionState: 'succeeded', payload: { summary: 'second done' } });
     await until(() => sent.length === 1);
     assert.deepEqual(sent[0].message.details.mailboxEventIds, ['first-result', 'second-result']);
