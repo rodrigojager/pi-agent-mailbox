@@ -1,11 +1,12 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, rmSync, readFileSync } from 'node:fs';
+import { mkdtempSync, rmSync, readFileSync, mkdirSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join, resolve, basename } from 'node:path';
+import { join, resolve, basename, dirname } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { createHash } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
+import { DatabaseSync } from 'node:sqlite';
 import { createSupervisor } from '../src/supervisor.mjs';
 import { MailboxClient, ensureToken } from '../src/client.mjs';
 import { MailboxStore } from '../src/store.mjs';
@@ -214,6 +215,92 @@ test('a claimed start survives restart without a second execution', async () => 
     await supervisor?.close();
     f.cleanup();
   }
+});
+
+test('a committed worker artifact is recovered after supervisor loss without relaunching the job', async () => {
+  const f = fixture();
+  let supervisor;
+  let client;
+  try {
+    const token = ensureToken(f.sessionId, f.baseDir);
+    supervisor = createSupervisor(f);
+    await supervisor.listen();
+    client = await MailboxClient.connect({ ...f, token });
+    const job = { jobId: 'artifact-after-crash', coordinatorId: 'root', workflowId: 'flow' };
+    await client.request('register', { job });
+    assert.equal(supervisor.store.claimStart(job.jobId), true);
+    client.close();
+    await supervisor.close();
+    const artifact = join(statePath(f.baseDir, f.sessionId), 'artifacts', `${job.jobId}.json`);
+    writeFileSync(artifact, JSON.stringify({ state: 'succeeded', summary: 'recovered from disk' }));
+
+    supervisor = createSupervisor(f);
+    await supervisor.listen();
+    client = await MailboxClient.connect({ ...f, token });
+    const events = [];
+    await client.subscribe(0, event => events.push(event));
+    assert.deepEqual(events.map(event => event.event_type), ['terminal']);
+    assert.equal(events[0].payload.summary, 'recovered from disk');
+    assert.equal((await client.request('job', { jobId: job.jobId })).state, 'succeeded');
+    const adapterPath = fileURLToPath(new URL('./fake-adapter.mjs', import.meta.url));
+    assert.equal((await client.request('start', { job, adapterPath })).duplicate, true);
+    assert.equal((await client.request('events', { after: 0 })).length, 1);
+  } finally {
+    client?.close();
+    await supervisor?.close();
+    f.cleanup();
+  }
+});
+
+test('a corrupt result artifact leaves execution indeterminate instead of reporting success', async () => {
+  const f = fixture();
+  let supervisor;
+  let client;
+  try {
+    const token = ensureToken(f.sessionId, f.baseDir);
+    supervisor = createSupervisor(f);
+    await supervisor.listen();
+    client = await MailboxClient.connect({ ...f, token });
+    const job = { jobId: 'corrupt-result', coordinatorId: 'root', workflowId: 'flow' };
+    await client.request('register', { job });
+    assert.equal(supervisor.store.claimStart(job.jobId), true);
+    client.close();
+    await supervisor.close();
+    writeFileSync(join(statePath(f.baseDir, f.sessionId), 'artifacts', `${job.jobId}.json`), '{invalid-json');
+
+    supervisor = createSupervisor(f);
+    await supervisor.listen();
+    client = await MailboxClient.connect({ ...f, token });
+    const events = await client.request('events', { after: 0 });
+    assert.deepEqual(events.map(event => event.event_type), ['supervision_lost']);
+    assert.equal((await client.request('job', { jobId: job.jobId })).state, 'unknown');
+  } finally {
+    client?.close();
+    await supervisor?.close();
+    f.cleanup();
+  }
+});
+
+test('schema v1 migrates once and an incompatible schema is refused', () => {
+  const f = fixture();
+  try {
+    const filename = join(statePath(f.baseDir, f.sessionId), 'journal.sqlite');
+    mkdirSync(dirname(filename), { recursive: true });
+    const old = new DatabaseSync(filename);
+    old.exec(`CREATE TABLE schema_meta (version INTEGER NOT NULL); INSERT INTO schema_meta VALUES (1);
+      CREATE TABLE jobs (job_id TEXT PRIMARY KEY, coordinator_id TEXT NOT NULL,
+        workflow_id TEXT NOT NULL, state TEXT NOT NULL, worker_pid INTEGER,
+        worker_started_at INTEGER, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL);`);
+    old.close();
+    const migrated = new MailboxStore(filename);
+    assert.equal(migrated.db.prepare('SELECT version FROM schema_meta').get().version, 2);
+    assert.ok(migrated.db.prepare('PRAGMA table_info(jobs)').all().some(column => column.name === 'goal_id'));
+    migrated.close();
+    const newer = new DatabaseSync(filename);
+    newer.exec('UPDATE schema_meta SET version=99');
+    newer.close();
+    assert.throws(() => new MailboxStore(filename), /Unsupported mailbox schema/);
+  } finally { f.cleanup(); }
 });
 
 test('subscription replays a backlog beyond one page exactly once', async () => {
