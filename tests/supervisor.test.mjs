@@ -502,6 +502,43 @@ test('subscription replays a backlog beyond one page exactly once', async () => 
   }
 });
 
+test('a paused subscriber has bounded socket backlog and recovers committed events by replay', async () => {
+  const f = fixture();
+  let supervisor;
+  let producer;
+  let consumer;
+  try {
+    const token = ensureToken(f.sessionId, f.baseDir);
+    supervisor = createSupervisor(f);
+    await supervisor.listen();
+    producer = await MailboxClient.connect({ ...f, token });
+    consumer = await MailboxClient.connect({ ...f, token });
+    await producer.request('register', { job: { jobId: 'slow-consumer', coordinatorId: 'root', workflowId: 'flow' } });
+    await consumer.subscribe(0, () => {});
+    consumer.socket.pause();
+    for (let index = 0; index < 750; index++) {
+      await producer.request('publish', {
+        event: { eventId: `slow-${index}`, jobId: 'slow-consumer', eventType: 'progress', payload: { text: 'X'.repeat(8192) } },
+      });
+    }
+    await producer.request('publish', {
+      event: { eventId: 'slow-terminal', jobId: 'slow-consumer', eventType: 'terminal', executionState: 'succeeded' },
+    });
+    assert.ok(supervisor.maxSocketBacklogBytes() <= 4 * 1024 * 1024);
+    consumer.close();
+    consumer = await MailboxClient.connect({ ...f, token });
+    const replayed = [];
+    await consumer.subscribe(0, event => replayed.push(event));
+    assert.equal(replayed.length, 751);
+    assert.equal(replayed.at(-1).event_id, 'slow-terminal');
+  } finally {
+    consumer?.close();
+    producer?.close();
+    await supervisor?.close();
+    f.cleanup();
+  }
+});
+
 test('a large result stays intact in its artifact while the event frame remains bounded', async () => {
   const f = fixture();
   let supervisor;

@@ -7,6 +7,10 @@ import { fileURLToPath } from 'node:url';
 import { endpointFor, encodeFrame, createFrameParser, PROTOCOL_VERSION, statePath } from './protocol.mjs';
 import { MailboxStore } from './store.mjs';
 
+const MAX_SOCKET_BACKLOG_BYTES = 4 * 1024 * 1024;
+const DROP_EPHEMERAL_AT_BYTES = 512 * 1024;
+const EPHEMERAL_EVENTS = new Set(['progress', 'heartbeat', 'suspected_stall']);
+
 function sameToken(left, right) {
   if (typeof left !== 'string' || typeof right !== 'string') return false;
   const a = Buffer.from(left, 'utf8');
@@ -242,7 +246,18 @@ export function createSupervisor({ sessionId, baseDir, idleTimeoutMs = 60000, st
     let authenticated = false;
     let subscribed = false;
     const send = payload => {
-      if (!socket.destroyed) socket.write(encodeFrame(payload));
+      if (socket.destroyed) return;
+      if (payload?.op === 'event' && EPHEMERAL_EVENTS.has(payload.value?.event_type) &&
+        socket.writableLength >= DROP_EPHEMERAL_AT_BYTES) return;
+      try {
+        const encoded = encodeFrame(payload);
+        if (socket.writableLength + Buffer.byteLength(encoded, 'utf8') > MAX_SOCKET_BACKLOG_BYTES) {
+          // A reconnect replays committed events; retaining an unbounded socket queue is unnecessary.
+          socket.destroy();
+          return;
+        }
+        socket.write(encoded);
+      } catch { socket.destroy(); }
     };
     const listener = event => send({ op: 'event', value: event });
     const handle = frame => {
@@ -358,6 +373,7 @@ export function createSupervisor({ sessionId, baseDir, idleTimeoutMs = 60000, st
     store,
     publish: publishAndNotify,
     ownerPresent: () => Boolean(ownerSocket && !ownerSocket.destroyed),
+    maxSocketBacklogBytes: () => Math.max(0, ...[...sockets].map(socket => socket.writableLength)),
     async listen() {
       await new Promise((resolve, reject) => {
         server.once('error', reject);

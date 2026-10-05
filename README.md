@@ -27,6 +27,7 @@ The orchestrator can call `subagent_wait` with exact `job_ids`, `mode: any|all`,
 - A terminal result and its pending delivery are committed together. Replay and history-ID deduplication provide at-least-once delivery while the local journal and destination session survive. An ACK means the result was recorded in Pi history, not that the model acted on it.
 - A crash around child startup may leave the execution **unknown**. The same job is never relaunched automatically after an uncertain start. A late result artifact can reconcile that state.
 - Heartbeats and lack-of-progress warnings update the UI without waking the model. Silence alone does not mark a child failed.
+- A slow client may miss ephemeral progress frames. Its socket backlog is capped at 4 MiB; reconnecting replays committed events, including every terminal result.
 - If a journal write fails, the supervisor reports storage unavailable and refuses new jobs until it is restarted after the storage problem is fixed. An already running worker can still leave an artifact for recovery; the coordinator never treats an uncommitted result as delivered.
 - The supervisor persists final results, but an OS or disk failure before an artifact or journal commit can lose the result. There is no atomic transaction spanning Pi history, SQLite, and a child’s external side effects.
 - Nested subagents continue to use `pi-subagent`’s existing synchronous child path. Their parent’s durable completion remains journaled. The mailbox does not reconstruct a lost child conversation.
