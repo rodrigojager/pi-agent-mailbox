@@ -40,7 +40,7 @@ test('the installed Pi CLI loads all extension entrypoints in an isolated RPC se
     '--no-skills', '--no-themes', '--no-prompt-templates',
     ...(useInstalledSettings ? [] : ['--no-extensions', ...entries.flatMap(entry => ['-e', entry])]),
   ], {
-    cwd: directory,
+    cwd: useInstalledSettings ? tmpdir() : directory,
     env: { ...process.env, PI_CODING_AGENT_DIR: useInstalledSettings ? resolve(installedRoot, '..') : join(directory, 'agent'), PI_OFFLINE: '1' },
     stdio: ['pipe', 'pipe', 'pipe'],
     windowsHide: true,
@@ -88,6 +88,6 @@ test('the installed Pi CLI loads all extension entrypoints in an isolated RPC se
     }
     if (!target.startsWith(resolve(tmpdir()) + '\\') && !target.startsWith(resolve(tmpdir()) + '/')) throw new Error('Refusing to delete outside temp');
     if (!basename(target).startsWith('pi-mailbox-loader-test-')) throw new Error('Unexpected fixture name');
-    rmSync(target, { recursive: true, force: true });
+    rmSync(target, { recursive: true, force: true, maxRetries: 50, retryDelay: 100 });
   }
 });
