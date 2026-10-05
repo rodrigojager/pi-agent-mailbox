@@ -466,9 +466,13 @@ export default function registerAgentMailbox(pi: ExtensionAPI, options: { baseDi
       const newBranch = ctx.sessionManager.getBranch(event.newLeafId);
       let common = 0;
       while (common < oldBranch.length && common < newBranch.length && oldBranch[common].id === newBranch[common].id) common++;
-      if (common < oldBranch.length && common < newBranch.length) {
+      if (common < oldBranch.length) {
+        const oldMarker = [...oldBranch].reverse().find(entry => entry.type === 'custom' && entry.customType === 'mailbox-workflow');
         const lastMarker = newBranch.findLastIndex(entry => entry.type === 'custom' && entry.customType === 'mailbox-workflow');
-        if (lastMarker >= 0 && lastMarker < common) {
+        const newMarker = lastMarker >= 0 ? newBranch[lastMarker] : undefined;
+        const oldWorkflow = oldMarker?.type === 'custom' ? (oldMarker.data as { id?: unknown } | undefined)?.id : undefined;
+        const newWorkflow = newMarker?.type === 'custom' ? (newMarker.data as { id?: unknown } | undefined)?.id : undefined;
+        if (lastMarker >= 0 && lastMarker < common && typeof newWorkflow === 'string' && oldWorkflow === newWorkflow) {
           pi.appendEntry('mailbox-workflow', { id: randomUUID(), sessionId: ctx.sessionManager.getSessionId() });
         }
       }
