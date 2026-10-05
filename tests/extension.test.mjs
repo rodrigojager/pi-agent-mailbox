@@ -196,7 +196,13 @@ test('goal all wait stays quiet on partial completion and sends one grouped resu
     assert.deepEqual(sent[0].message.details.mailboxEventIds, ['first-result', 'second-result']);
     assert.match(sent[0].message.content, /first done[\s\S]*second done/);
     assert.equal(sent[0].options.triggerTurn, true);
+    branch.push({ id: 'grouped-history', type: 'custom_message', customType: 'subagent-result', details: sent[0].message.details });
+    for (const handler of handlers.get('message_end') ?? []) handler({}, ctx);
+    await until(() => ['first-result', 'second-result'].every(eventId =>
+      supervisor.store.db.prepare('SELECT state FROM deliveries WHERE event_id=?').get(eventId)?.state === 'recorded'));
     branch.push({ id: 'replacement-goal', type: 'custom', customType: 'goal-state', data: { goal: { id: 'new-goal', status: 'active', waiting: { reason: 'new work' } } } });
+    for (const handler of handlers.get('session_tree') ?? []) handler({ oldLeafId: null, newLeafId: null }, ctx);
+    await until(() => supervisor.store.db.prepare('SELECT state FROM waits WHERE wait_id=?').get(armed.waitId)?.state === 'cancelled');
     supervisor.store.registerJob({ jobId: 'old-goal-job', coordinatorId: sessionId, workflowId, goalId });
     supervisor.publish({ eventId: 'old-goal-result', jobId: 'old-goal-job', eventType: 'terminal', executionState: 'succeeded', payload: { summary: 'late old result' } });
     await until(() => sent.length === 2);

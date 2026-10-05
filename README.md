@@ -34,6 +34,8 @@ The orchestrator can call `subagent_wait` with exact `job_ids`, `mode: any|all`,
 
 No credentials or environment dumps are written to the journal. Keep the state directory private and backed up if these results matter. Do not delete it while jobs or deliveries are pending.
 
+Recorded results become eligible for pruning after 30 days by default. Startup and daily maintenance remove old event payloads and artifacts only after every delivery for that job has been recorded in Pi history and no active or ready wait refers to it. Pending deliveries, indeterminate jobs, and small job-ID tombstones remain. `PI_AGENT_MAILBOX_RETENTION_DAYS` accepts 0 to disable pruning or 1–3650 days to change the period. Maintenance uses a passive WAL checkpoint; `/mailbox` reports a checkpoint or artifact cleanup warning.
+
 ## Development
 
 Run `npm test` and `npm run typecheck`. Tests cover replay, ownership, worker execution, disconnects, waits, ACKs, cancellation, and the real adapter/goal bridge when their sibling package worktrees are present.

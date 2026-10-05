@@ -476,6 +476,138 @@ test('schema v1 migrates once and an incompatible schema is refused', () => {
   } finally { f.cleanup(); }
 });
 
+test('retention prunes only old recorded results without waits and keeps job tombstones', () => {
+  const f = fixture();
+  try {
+    const filename = join(statePath(f.baseDir, f.sessionId), 'journal.sqlite');
+    const store = new MailboxStore(filename);
+    const old = Date.now() - 120000;
+    const cutoff = Date.now() - 60000;
+    for (const jobId of ['recorded', 'pending', 'waiting', 'unknown', 'recent', 'cancelled-wait']) {
+      store.registerJob({ jobId, coordinatorId: 'root', workflowId: 'flow' });
+    }
+    store.armWait({ waitId: 'cancelled', coordinatorId: 'root', workflowId: 'flow', jobIds: ['cancelled-wait'], mode: 'all' });
+    store.cancelWait('cancelled');
+    for (const jobId of ['recorded', 'pending', 'waiting', 'recent', 'cancelled-wait']) {
+      store.publish({ eventId: `${jobId}-terminal`, jobId, eventType: 'terminal', executionState: 'succeeded' });
+      if (jobId !== 'pending') store.ack(`${jobId}-terminal`, `${jobId}-history`);
+    }
+    store.publish({ eventId: 'unknown-result', jobId: 'unknown', eventType: 'supervision_lost', executionState: 'unknown' });
+    store.ack('unknown-result', 'unknown-history');
+    store.armWait({ waitId: 'ready', coordinatorId: 'root', workflowId: 'flow', jobIds: ['waiting'], mode: 'all' });
+    store.db.prepare("UPDATE jobs SET updated_at=? WHERE job_id!='recent'").run(old);
+    store.db.prepare("UPDATE deliveries SET recorded_at=? WHERE state='recorded' AND event_id!='recent-terminal'").run(old);
+    store.db.prepare("UPDATE waits SET created_at=? WHERE wait_id='cancelled'").run(old);
+
+    const pruned = store.pruneRecorded(cutoff);
+    assert.deepEqual(pruned.jobIds.sort(), ['cancelled-wait', 'recorded']);
+    assert.equal(pruned.waits, 1);
+    assert.equal(store.db.prepare('SELECT COUNT(*) AS n FROM events WHERE job_id=?').get('recorded').n, 0);
+    for (const jobId of ['pending', 'waiting', 'unknown', 'recent']) {
+      assert.equal(store.db.prepare('SELECT COUNT(*) AS n FROM events WHERE job_id=?').get(jobId).n, 1);
+    }
+    assert.equal(store.getJob('recorded').state, 'succeeded');
+    assert.deepEqual(store.pruneRecorded(cutoff).jobIds, []);
+    assert.equal(store.cancelWait('ready').state, 'cancelled');
+    assert.deepEqual(store.pruneRecorded(cutoff).jobIds, ['waiting']);
+    assert.equal(store.checkpoint().busy, 0);
+    store.close();
+  } finally { f.cleanup(); }
+});
+
+test('startup retention removes an acknowledged artifact and preserves a pending one', async () => {
+  const f = fixture();
+  let supervisor;
+  try {
+    ensureToken(f.sessionId, f.baseDir);
+    supervisor = createSupervisor({ ...f, retentionMs: 1000 });
+    await supervisor.listen();
+    const artifactDir = join(statePath(f.baseDir, f.sessionId), 'artifacts');
+    for (const jobId of ['old-ack', 'old-pending']) {
+      supervisor.store.registerJob({ jobId, coordinatorId: 'root', workflowId: 'flow' });
+      writeFileSync(join(artifactDir, `${jobId}.json`), JSON.stringify({ state: 'succeeded', summary: jobId }));
+      supervisor.publish({ eventId: `${jobId}-terminal`, jobId, eventType: 'terminal', executionState: 'succeeded' });
+    }
+    supervisor.store.ack('old-ack-terminal', 'history-entry');
+    const old = Date.now() - 10000;
+    supervisor.store.db.prepare('UPDATE jobs SET updated_at=?').run(old);
+    supervisor.store.db.prepare("UPDATE deliveries SET recorded_at=? WHERE event_id='old-ack-terminal'").run(old);
+    await supervisor.close();
+
+    supervisor = createSupervisor({ ...f, retentionMs: 1000 });
+    await supervisor.listen();
+    assert.equal(existsSync(join(artifactDir, 'old-ack.json')), false);
+    assert.equal(existsSync(join(artifactDir, 'old-pending.json')), true);
+    assert.equal(supervisor.store.getJob('old-ack').state, 'succeeded');
+    assert.deepEqual(supervisor.store.eventsAfter(0).map(event => event.event_id), ['old-pending-terminal']);
+  } finally {
+    await supervisor?.close();
+    f.cleanup();
+  }
+});
+
+test('a locked journal defers retention without deleting a confirmed result', () => {
+  const f = fixture();
+  let store;
+  let locker;
+  try {
+    const filename = join(statePath(f.baseDir, f.sessionId), 'journal.sqlite');
+    store = new MailboxStore(filename);
+    store.registerJob({ jobId: 'locked-result', coordinatorId: 'root', workflowId: 'flow' });
+    store.publish({ eventId: 'locked-terminal', jobId: 'locked-result', eventType: 'terminal', executionState: 'succeeded' });
+    store.ack('locked-terminal', 'recorded-history');
+    const old = Date.now() - 120000;
+    store.db.prepare('UPDATE jobs SET updated_at=?').run(old);
+    store.db.prepare('UPDATE deliveries SET recorded_at=?').run(old);
+    locker = new DatabaseSync(filename);
+    locker.exec('BEGIN IMMEDIATE');
+    assert.throws(() => store.pruneRecorded(Date.now() - 60000), /locked|busy/i);
+    assert.equal(store.eventsAfter(0).length, 1);
+    locker.exec('ROLLBACK');
+    locker.close();
+    locker = undefined;
+    assert.deepEqual(store.pruneRecorded(Date.now() - 60000).jobIds, ['locked-result']);
+  } finally {
+    try { locker?.exec('ROLLBACK'); } catch {}
+    locker?.close();
+    store?.close();
+    f.cleanup();
+  }
+});
+
+test('startup stays responsive when retention is deferred by a journal lock', async () => {
+  const f = fixture();
+  let locker;
+  let supervisor;
+  let client;
+  try {
+    const token = ensureToken(f.sessionId, f.baseDir);
+    const filename = join(statePath(f.baseDir, f.sessionId), 'journal.sqlite');
+    const store = new MailboxStore(filename);
+    store.registerJob({ jobId: 'retained', coordinatorId: 'root', workflowId: 'flow' });
+    store.publish({ eventId: 'retained-terminal', jobId: 'retained', eventType: 'terminal', executionState: 'succeeded' });
+    store.ack('retained-terminal', 'history');
+    store.db.prepare('UPDATE jobs SET updated_at=?').run(Date.now() - 120000);
+    store.db.prepare('UPDATE deliveries SET recorded_at=?').run(Date.now() - 120000);
+    store.close();
+    locker = new DatabaseSync(filename);
+    locker.exec('BEGIN IMMEDIATE');
+    supervisor = createSupervisor({ ...f, retentionMs: 1000 });
+    await supervisor.listen();
+    client = await MailboxClient.connect({ ...f, token });
+    const health = await client.request('ping');
+    assert.equal(health.storageError, null);
+    assert.match(health.maintenanceWarning, /deferred.*locked/i);
+    assert.equal(supervisor.store.eventsAfter(0).length, 1);
+  } finally {
+    client?.close();
+    await supervisor?.close();
+    try { locker?.exec('ROLLBACK'); } catch {}
+    locker?.close();
+    f.cleanup();
+  }
+});
+
 test('subscription replays a backlog beyond one page exactly once', async () => {
   const f = fixture();
   let supervisor;

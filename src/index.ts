@@ -201,13 +201,15 @@ export default function registerAgentMailbox(pi: ExtensionAPI, options: { baseDi
   async function flushGoalWait() {
     const binding = goalBinding;
     const ctx = currentContext;
-    if (!binding || !ctx || !client?.isOwner || !binding.committed || !binding.settled || binding.flushing) return;
+    if (!binding || !ctx || !client?.isOwner || !binding.committed || binding.flushing) return;
     if (ctx.sessionManager.getSessionId() !== binding.sessionId || workflowFor(ctx) !== binding.workflowId) return;
+    if (!binding.settled && waitingGoalId(ctx) === binding.goalId) return;
     binding.flushing = true;
     try {
       if (waitingGoalId(ctx) !== binding.goalId) {
-        goalBinding = undefined;
         const events = await client.request('wait_results', { waitId: binding.waitId }) as MailboxEvent[];
+        await client.request('cancel_wait', { waitId: binding.waitId });
+        if (goalBinding === binding) goalBinding = undefined;
         for (const event of events) await deliver(event);
         return;
       }
@@ -219,7 +221,11 @@ export default function registerAgentMailbox(pi: ExtensionAPI, options: { baseDi
       if (!status?.ready) return;
       const events = await client.request('wait_results', { waitId: binding.waitId }) as MailboxEvent[];
       const pending = events.filter(event => !historyEntryFor(ctx, event.event_id));
-      if (!pending.length) { goalBinding = undefined; return; }
+      if (!pending.length) {
+        await client.request('cancel_wait', { waitId: binding.waitId });
+        if (goalBinding === binding) goalBinding = undefined;
+        return;
+      }
       if (pending.some(event => inFlight.has(event.event_id))) return;
       const messages: string[] = [];
       const results: unknown[] = [];
@@ -467,7 +473,10 @@ export default function registerAgentMailbox(pi: ExtensionAPI, options: { baseDi
         }
       }
     }
-    if (client) void replayForCurrentBranch(ctx).catch(() => {});
+    if (client) {
+      if (goalBinding) void flushGoalWait().catch(error => ctx.ui?.notify(`Mailbox wait error: ${error}`, 'error'));
+      void replayForCurrentBranch(ctx).catch(() => {});
+    }
   });
   const onBoundary = (ctx: ExtensionContext, settled: boolean) => {
     currentContext = ctx;
@@ -501,6 +510,7 @@ export default function registerAgentMailbox(pi: ExtensionAPI, options: { baseDi
         }
         const result = await opened.request('ping');
         if (result.storageError) ctx.ui?.notify(`Mailbox storage unavailable: ${result.storageError}`, 'error');
+        else if (result.maintenanceWarning) ctx.ui?.notify(`Mailbox maintenance: ${result.maintenanceWarning}`, 'warning');
         else ctx.ui?.notify(`Mailbox ${opened.isOwner ? 'owner' : 'observer'} · ${new Date(result.at).toLocaleTimeString()}`, 'info');
       } catch (error) {
         ctx.ui?.notify(`Mailbox unavailable: ${error instanceof Error ? error.message : String(error)}`, 'error');

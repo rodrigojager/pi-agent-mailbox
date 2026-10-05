@@ -19,6 +19,7 @@ export class MailboxStore {
         worker_pid INTEGER, worker_started_at INTEGER,
         created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL
       );
+      CREATE INDEX IF NOT EXISTS jobs_state_updated ON jobs(state, updated_at);
       CREATE TABLE IF NOT EXISTS events (
         seq INTEGER PRIMARY KEY AUTOINCREMENT, event_id TEXT NOT NULL UNIQUE,
         job_id TEXT NOT NULL, event_type TEXT NOT NULL,
@@ -72,6 +73,29 @@ export class MailboxStore {
     this.getWaitStmt = this.db.prepare('SELECT * FROM waits WHERE wait_id = ?');
     this.updateWait = this.db.prepare("UPDATE waits SET state=? WHERE wait_id=?");
     this.waitsForJob = this.db.prepare("SELECT * FROM waits WHERE state='armed' AND job_ids LIKE ?");
+    this.retentionCandidates = this.db.prepare(`
+      SELECT j.job_id FROM jobs j
+      WHERE j.state IN ('succeeded', 'failed', 'cancelled') AND j.updated_at < ?
+        AND EXISTS (
+          SELECT 1 FROM events e JOIN deliveries d ON d.event_id=e.event_id
+          WHERE e.job_id=j.job_id
+        )
+        AND NOT EXISTS (
+          SELECT 1 FROM events e LEFT JOIN deliveries d ON d.event_id=e.event_id
+          WHERE e.job_id=j.job_id AND (
+            (d.event_id IS NOT NULL AND (d.state!='recorded' OR d.recorded_at IS NULL OR d.recorded_at >= ?))
+            OR (e.event_type IN ('terminal','supervision_lost','worker_exit','worker_error','persistence_failed') AND d.event_id IS NULL)
+          )
+        )
+        AND NOT EXISTS (
+          SELECT 1 FROM waits w, json_each(w.job_ids) target
+          WHERE w.state IN ('armed','ready') AND target.value=j.job_id
+        )
+      ORDER BY j.updated_at LIMIT ?
+    `);
+    this.deleteDeliveriesForJob = this.db.prepare('DELETE FROM deliveries WHERE event_id IN (SELECT event_id FROM events WHERE job_id=?)');
+    this.deleteEventsForJob = this.db.prepare('DELETE FROM events WHERE job_id=?');
+    this.deleteExpiredCancelledWaits = this.db.prepare("DELETE FROM waits WHERE state='cancelled' AND created_at < ?");
   }
 
   registerJob({ jobId, coordinatorId, workflowId, goalId = null }) {
@@ -206,7 +230,7 @@ export class MailboxStore {
 
   cancelWait(waitId) {
     const current = this.getWaitStmt.get(waitId);
-    if (current?.state === 'armed') this.updateWait.run('cancelled', waitId);
+    if (current && ['armed', 'ready'].includes(current.state)) this.updateWait.run('cancelled', waitId);
     return this.getWait(waitId);
   }
 
@@ -225,6 +249,30 @@ export class MailboxStore {
     const changed = this.ackDelivery.run(entryId, Date.now(), eventId).changes;
     if (!changed) throw new Error('Unknown terminal event');
     return this.db.prepare('SELECT * FROM deliveries WHERE event_id = ?').get(eventId);
+  }
+
+  pruneRecorded(before, limit = 1000) {
+    if (!Number.isSafeInteger(before) || before < 0 || !Number.isSafeInteger(limit) || limit < 1 || limit > 1000) {
+      throw new Error('Invalid mailbox retention bounds');
+    }
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      const jobIds = this.retentionCandidates.all(before, before, limit).map(row => row.job_id);
+      for (const jobId of jobIds) {
+        this.deleteDeliveriesForJob.run(jobId);
+        this.deleteEventsForJob.run(jobId);
+      }
+      const waits = this.deleteExpiredCancelledWaits.run(before).changes;
+      this.db.exec('COMMIT');
+      return { jobIds, waits };
+    } catch (error) {
+      this.db.exec('ROLLBACK');
+      throw error;
+    }
+  }
+
+  checkpoint() {
+    return this.db.prepare('PRAGMA wal_checkpoint(PASSIVE)').get();
   }
 
   close() { this.db.close(); }

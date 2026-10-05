@@ -1,5 +1,5 @@
 import { createServer } from 'node:net';
-import { readFileSync, existsSync, mkdirSync, watch } from 'node:fs';
+import { readFileSync, existsSync, mkdirSync, unlinkSync, watch } from 'node:fs';
 import { join, isAbsolute } from 'node:path';
 import { timingSafeEqual, createHash } from 'node:crypto';
 import { fork } from 'node:child_process';
@@ -10,6 +10,7 @@ import { MailboxStore } from './store.mjs';
 const MAX_SOCKET_BACKLOG_BYTES = 4 * 1024 * 1024;
 const DROP_EPHEMERAL_AT_BYTES = 512 * 1024;
 const EPHEMERAL_EVENTS = new Set(['progress', 'heartbeat', 'suspected_stall']);
+const RETENTION_INTERVAL_MS = 24 * 60 * 60 * 1000;
 
 function sameToken(left, right) {
   if (typeof left !== 'string' || typeof right !== 'string') return false;
@@ -24,7 +25,16 @@ function isStorageFailure(error) {
     (code.startsWith('SQLITE_') || code.startsWith('ERR_SQLITE_') || ['ENOSPC', 'EIO', 'EROFS', 'EACCES', 'EPERM'].includes(code));
 }
 
-export function createSupervisor({ sessionId, baseDir, idleTimeoutMs = 60000, stallTimeoutMs = 300000, onIdle }) {
+function isTransientLock(error) {
+  return ['SQLITE_BUSY', 'SQLITE_LOCKED', 'ERR_SQLITE_ERROR'].includes(error?.code)
+    && /database (?:is )?locked|database is busy/i.test(error?.message ?? '');
+}
+
+export function createSupervisor({ sessionId, baseDir, idleTimeoutMs = 60000, stallTimeoutMs = 300000,
+  retentionMs = Number(process.env.PI_AGENT_MAILBOX_RETENTION_DAYS ?? 30) * RETENTION_INTERVAL_MS, onIdle }) {
+  if (!Number.isSafeInteger(retentionMs) || retentionMs < 0 || retentionMs > 3650 * RETENTION_INTERVAL_MS) {
+    throw new Error('Invalid Pi mailbox retention period');
+  }
   const directory = statePath(baseDir, sessionId);
   const token = readFileSync(join(directory, 'token'), 'utf8').trim();
   const store = new MailboxStore(join(directory, 'journal.sqlite'));
@@ -38,6 +48,7 @@ export function createSupervisor({ sessionId, baseDir, idleTimeoutMs = 60000, st
   let ownerGeneration = 0;
   let closed = false;
   let storageError;
+  let maintenanceWarning;
   let idleTimer;
   const clearIdle = () => {
     if (idleTimer) clearTimeout(idleTimer);
@@ -83,6 +94,43 @@ export function createSupervisor({ sessionId, baseDir, idleTimeoutMs = 60000, st
       payload: { error: storageError, at: Date.now() },
     });
   }
+
+  function maintainJournal() {
+    if (retentionMs > 0) {
+      const { jobIds } = store.pruneRecorded(Date.now() - retentionMs);
+      for (const jobId of jobIds) {
+        if (!/^[a-zA-Z0-9_-]{1,128}$/.test(jobId)) continue;
+        try { unlinkSync(join(artifactDir, `${jobId}.json`)); }
+        catch (error) {
+          if (error?.code !== 'ENOENT') maintenanceWarning = `Could not remove retained artifact for ${jobId}: ${error}`;
+        }
+      }
+    }
+    const checkpoint = store.checkpoint();
+    if (checkpoint?.busy) maintenanceWarning = 'Mailbox WAL checkpoint is busy';
+  }
+
+  function runMaintenance() {
+    try {
+      maintenanceWarning = undefined;
+      maintainJournal();
+    } catch (error) {
+      if (isTransientLock(error)) {
+        maintenanceWarning = `Mailbox maintenance deferred: ${error.message}`;
+      } else if (isStorageFailure(error)) {
+        noteStorageFailure(error);
+      } else {
+        maintenanceWarning = error instanceof Error ? error.message : String(error);
+      }
+    }
+  }
+
+  runMaintenance();
+  const maintenanceTimer = setInterval(() => {
+    if (closed || storageError) return;
+    runMaintenance();
+  }, RETENTION_INTERVAL_MS);
+  maintenanceTimer.unref?.();
 
   function publishAndNotify(event) {
     let value;
@@ -341,7 +389,7 @@ export function createSupervisor({ sessionId, baseDir, idleTimeoutMs = 60000, st
             value = store.ack(frame.eventId, frame.entryId);
             break;
           case 'ping':
-            value = { at: Date.now(), storageError: storageError ?? null };
+            value = { at: Date.now(), storageError: storageError ?? null, maintenanceWarning: maintenanceWarning ?? null };
             break;
           default:
             throw new Error('Unsupported mailbox operation');
@@ -389,6 +437,7 @@ export function createSupervisor({ sessionId, baseDir, idleTimeoutMs = 60000, st
       closed = true;
       clearIdle();
       clearInterval(heartbeat);
+      clearInterval(maintenanceTimer);
       for (const jobId of stallTimers.keys()) clearStall(jobId);
       artifactWatcher.close();
       for (const socket of sockets) socket.destroy();
