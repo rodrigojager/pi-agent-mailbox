@@ -7,6 +7,7 @@ import { randomUUID } from 'node:crypto';
 import { createHash } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { DatabaseSync } from 'node:sqlite';
+import { spawn } from 'node:child_process';
 import { createSupervisor } from '../src/supervisor.mjs';
 import { MailboxClient, ensureToken } from '../src/client.mjs';
 import { MailboxStore } from '../src/store.mjs';
@@ -277,6 +278,70 @@ test('a corrupt result artifact leaves execution indeterminate instead of report
   } finally {
     client?.close();
     await supervisor?.close();
+    f.cleanup();
+  }
+});
+
+test('a worker result survives an abrupt supervisor exit on Windows', {
+  skip: process.platform !== 'win32', timeout: 20000,
+}, async () => {
+  const f = fixture();
+  const token = ensureToken(f.sessionId, f.baseDir);
+  const supervisorPath = fileURLToPath(new URL('../src/supervisor.mjs', import.meta.url));
+  const child = spawn(process.execPath, [supervisorPath, f.sessionId, f.baseDir], {
+    stdio: 'ignore', windowsHide: true,
+  });
+  let client;
+  let recovered;
+  try {
+    const deadline = Date.now() + 5000;
+    while (!client && Date.now() < deadline) {
+      try { client = await MailboxClient.connect({ ...f, token, timeoutMs: 300 }); }
+      catch { await new Promise(resolve => setTimeout(resolve, 20)); }
+    }
+    assert.ok(client, 'isolated supervisor did not start');
+    const jobId = 'survive-parent-exit';
+    const progress = new Promise((resolveProgress, reject) => {
+      const timer = setTimeout(() => reject(new Error('Worker did not start')), 5000);
+      client.subscribe(0, event => {
+        if (event.event_type === 'progress' && event.job_id === jobId) {
+          clearTimeout(timer); resolveProgress();
+        }
+      }).catch(reject);
+    });
+    const adapterPath = fileURLToPath(new URL('./fake-adapter.mjs', import.meta.url));
+    await client.request('start', {
+      job: { jobId, coordinatorId: 'root', workflowId: 'flow', delayMs: 1800 }, adapterPath,
+    });
+    await progress;
+    child.kill();
+    await new Promise((resolveExit, reject) => {
+      const timer = setTimeout(() => reject(new Error('Isolated supervisor did not exit')), 5000);
+      child.once('exit', () => { clearTimeout(timer); resolveExit(); });
+    });
+    client.close();
+    client = undefined;
+
+    recovered = createSupervisor(f);
+    await recovered.listen();
+    client = await MailboxClient.connect({ ...f, token });
+    const events = [];
+    const terminal = new Promise((resolveTerminal, reject) => {
+      const timer = setTimeout(() => reject(new Error('Detached worker result was not recovered')), 10000);
+      client.subscribe(0, event => {
+        events.push(event);
+        if (event.event_type === 'terminal' && event.job_id === jobId) {
+          clearTimeout(timer); resolveTerminal(event);
+        }
+      }).catch(reject);
+    });
+    assert.equal((await terminal).payload.state, 'succeeded');
+    assert.equal(events.filter(event => event.event_type === 'terminal' && event.job_id === jobId).length, 1);
+    assert.equal((await client.request('job', { jobId })).state, 'succeeded');
+  } finally {
+    client?.close();
+    await recovered?.close();
+    if (child.exitCode === null) child.kill();
     f.cleanup();
   }
 });
