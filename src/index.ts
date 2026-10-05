@@ -21,7 +21,7 @@ type MailboxEvent = {
   event_id: string;
   event_type: string;
   job_id: string;
-  payload?: { state?: string; summary?: string; resultRef?: string; resultSha256?: string };
+  payload?: { state?: string; summary?: string; resultRef?: string; resultSha256?: string; error?: string };
 };
 type GoalBinding = {
   waitId: string; goalId: string; sessionId: string; workflowId: string;
@@ -46,11 +46,12 @@ export default function registerAgentMailbox(pi: ExtensionAPI, options: { baseDi
   const deliveryChecks = new Map<string, ReturnType<typeof setTimeout>>();
   let goalBinding: GoalBinding | undefined;
 
-  const setHealth = (ctx: ExtensionContext, state: 'responsive' | 'disconnected' | 'suspected_stall' | 'observer') => {
+  const setHealth = (ctx: ExtensionContext, state: 'responsive' | 'disconnected' | 'suspected_stall' | 'observer' | 'storage_unavailable') => {
     pi.events.emit(MAILBOX_HEALTH_CHANNEL, { sessionId: ctx.sessionManager.getSessionId(), state });
     if (!ctx.hasUI) return;
     const label = state === 'responsive' ? undefined
       : state === 'suspected_stall' ? '⚠ mailbox sem heartbeat'
+        : state === 'storage_unavailable' ? '⚠ mailbox sem armazenamento'
         : state === 'observer' ? 'mailbox: sessão observadora' : '⚠ mailbox desconectado';
     ctx.ui.setStatus('pi-agent-mailbox-health', label);
   };
@@ -259,6 +260,13 @@ export default function registerAgentMailbox(pi: ExtensionAPI, options: { baseDi
       if (client && currentContext) armHeartbeat(client, currentContext);
       return;
     }
+    if (event.event_type === 'storage_unavailable') {
+      if (currentContext && connectedSession === currentContext.sessionManager.getSessionId()) {
+        setHealth(currentContext, 'storage_unavailable');
+        currentContext.ui?.notify(`Mailbox storage unavailable: ${event.payload?.error ?? 'unknown error'}`, 'error');
+      }
+      return;
+    }
     if (!client?.isOwner) return;
     pi.events.emit(MAILBOX_EVENT_CHANNEL, event);
     if (!['terminal', 'supervision_lost', 'worker_exit', 'worker_error', 'persistence_failed'].includes(event.event_type)) return;
@@ -338,7 +346,8 @@ export default function registerAgentMailbox(pi: ExtensionAPI, options: { baseDi
         throw error;
       }
       reconnectAttempts = 0;
-      setHealth(ctx, opened.isOwner ? 'responsive' : 'observer');
+      const health = await opened.request('ping');
+      setHealth(ctx, health?.storageError ? 'storage_unavailable' : opened.isOwner ? 'responsive' : 'observer');
       if (goalBinding?.sessionId === sessionId) void flushGoalWait();
       return opened;
     })();
@@ -491,7 +500,8 @@ export default function registerAgentMailbox(pi: ExtensionAPI, options: { baseDi
           return;
         }
         const result = await opened.request('ping');
-        ctx.ui?.notify(`Mailbox ${opened.isOwner ? 'owner' : 'observer'} · ${new Date(result.at).toLocaleTimeString()}`, 'info');
+        if (result.storageError) ctx.ui?.notify(`Mailbox storage unavailable: ${result.storageError}`, 'error');
+        else ctx.ui?.notify(`Mailbox ${opened.isOwner ? 'owner' : 'observer'} · ${new Date(result.at).toLocaleTimeString()}`, 'info');
       } catch (error) {
         ctx.ui?.notify(`Mailbox unavailable: ${error instanceof Error ? error.message : String(error)}`, 'error');
       }

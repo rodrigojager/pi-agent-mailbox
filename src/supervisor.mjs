@@ -14,6 +14,12 @@ function sameToken(left, right) {
   return a.length === b.length && timingSafeEqual(a, b);
 }
 
+function isStorageFailure(error) {
+  const code = error?.code;
+  return typeof code === 'string' &&
+    (code.startsWith('SQLITE_') || code.startsWith('ERR_SQLITE_') || ['ENOSPC', 'EIO', 'EROFS', 'EACCES', 'EPERM'].includes(code));
+}
+
 export function createSupervisor({ sessionId, baseDir, idleTimeoutMs = 60000, stallTimeoutMs = 300000, onIdle }) {
   const directory = statePath(baseDir, sessionId);
   const token = readFileSync(join(directory, 'token'), 'utf8').trim();
@@ -27,6 +33,7 @@ export function createSupervisor({ sessionId, baseDir, idleTimeoutMs = 60000, st
   let ownerSocket;
   let ownerGeneration = 0;
   let closed = false;
+  let storageError;
   let idleTimer;
   const clearIdle = () => {
     if (idleTimer) clearTimeout(idleTimer);
@@ -63,15 +70,32 @@ export function createSupervisor({ sessionId, baseDir, idleTimeoutMs = 60000, st
     stallTimers.set(jobId, timer);
   };
 
+  function noteStorageFailure(error, jobId) {
+    if (storageError) return;
+    storageError = error instanceof Error ? error.message : String(error);
+    for (const listener of subscribers) listener({
+      event_id: `storage-unavailable:${jobId ?? 'session'}`,
+      event_type: 'storage_unavailable', job_id: jobId ?? '',
+      payload: { error: storageError, at: Date.now() },
+    });
+  }
+
   function publishAndNotify(event) {
-    const value = store.publish(event);
+    let value;
+    try { value = store.publish(event); }
+    catch (error) {
+      if (isStorageFailure(error)) noteStorageFailure(error, event.jobId);
+      throw error;
+    }
     if (!value.duplicate) for (const listener of subscribers) listener(value);
     return value;
   }
 
   function reconcileArtifact(jobId) {
     if (closed) return;
-    const job = store.getJob(jobId);
+    let job;
+    try { job = store.getJob(jobId); }
+    catch (error) { noteStorageFailure(error, jobId); return; }
     if (!job || ['succeeded', 'failed', 'cancelled'].includes(job.state)) return;
     const filename = join(artifactDir, `${jobId}.json`);
     if (!existsSync(filename)) return;
@@ -121,6 +145,7 @@ export function createSupervisor({ sessionId, baseDir, idleTimeoutMs = 60000, st
   });
 
   function startJob(frame) {
+    if (storageError) throw new Error(`Mailbox storage unavailable: ${storageError}`);
     const job = frame.job;
     if (!job || !/^[a-zA-Z0-9_-]{1,128}$/.test(job.jobId ?? '')) throw new Error('Invalid worker job ID');
     if (!isAbsolute(frame.adapterPath)) throw new Error('Worker adapter path must be absolute');
@@ -147,11 +172,23 @@ export function createSupervisor({ sessionId, baseDir, idleTimeoutMs = 60000, st
         payload: { error: error instanceof Error ? error.message : String(error) } });
       return { job: store.getJob(job.jobId), duplicate: false };
     }
-    store.recordWorker(job.jobId, worker.pid);
+    try { store.recordWorker(job.jobId, worker.pid); }
+    catch (error) {
+      if (isStorageFailure(error)) noteStorageFailure(error, job.jobId);
+      try { worker.kill(); } catch { /* Worker may have exited already. */ }
+      throw error;
+    }
     workers.set(job.jobId, worker);
     clearIdle();
     armStall(job.jobId);
-    publishAndNotify({ eventId: `started:${job.jobId}`, jobId: job.jobId, eventType: 'started', executionState: 'running', payload: { workerPid: worker.pid } });
+    try {
+      publishAndNotify({ eventId: `started:${job.jobId}`, jobId: job.jobId, eventType: 'started', executionState: 'running', payload: { workerPid: worker.pid } });
+    } catch (error) {
+      clearStall(job.jobId);
+      workers.delete(job.jobId);
+      try { worker.kill(); } catch { /* Worker may have exited already. */ }
+      throw error;
+    }
     worker.on('message', message => {
       if (closed) return;
       if (message?.op === 'progress') {
@@ -161,7 +198,9 @@ export function createSupervisor({ sessionId, baseDir, idleTimeoutMs = 60000, st
       } else if (message?.op === 'done') {
         reconcileArtifact(job.jobId);
       } else if (message?.op === 'failed_to_persist') {
-        publishAndNotify({ eventId: `persist-error:${job.jobId}`, jobId: job.jobId, eventType: 'persistence_failed', executionState: 'unknown', payload: { error: message.error } });
+        try {
+          publishAndNotify({ eventId: `persist-error:${job.jobId}`, jobId: job.jobId, eventType: 'persistence_failed', executionState: 'unknown', payload: { error: message.error } });
+        } catch { /* The storage health event already reported the failure. */ }
       }
     });
     worker.on('exit', (code, signal) => {
@@ -169,18 +208,26 @@ export function createSupervisor({ sessionId, baseDir, idleTimeoutMs = 60000, st
       workers.delete(job.jobId);
       if (closed) return;
       reconcileArtifact(job.jobId);
-      const current = store.getJob(job.jobId);
-      if (current && !['succeeded', 'failed', 'cancelled', 'unknown'].includes(current.state)) {
-        publishAndNotify({ eventId: `worker-exit:${job.jobId}`, jobId: job.jobId, eventType: 'worker_exit', executionState: 'failed', payload: { code, signal } });
+      try {
+        const current = store.getJob(job.jobId);
+        if (current && !['succeeded', 'failed', 'cancelled', 'unknown'].includes(current.state)) {
+          publishAndNotify({ eventId: `worker-exit:${job.jobId}`, jobId: job.jobId, eventType: 'worker_exit', executionState: 'failed', payload: { code, signal } });
+        }
+      } catch (error) {
+        if (isStorageFailure(error)) noteStorageFailure(error, job.jobId);
       }
       scheduleIdle();
     });
     worker.on('error', error => {
       clearStall(job.jobId);
       if (closed) return;
-      const current = store.getJob(job.jobId);
-      if (current && !['succeeded', 'failed', 'cancelled', 'unknown'].includes(current.state)) {
-        publishAndNotify({ eventId: `worker-error:${job.jobId}`, jobId: job.jobId, eventType: 'worker_error', executionState: 'failed', payload: { error: error.message } });
+      try {
+        const current = store.getJob(job.jobId);
+        if (current && !['succeeded', 'failed', 'cancelled', 'unknown'].includes(current.state)) {
+          publishAndNotify({ eventId: `worker-error:${job.jobId}`, jobId: job.jobId, eventType: 'worker_error', executionState: 'failed', payload: { error: error.message } });
+        }
+      } catch (failure) {
+        if (isStorageFailure(failure)) noteStorageFailure(failure, job.jobId);
       }
     });
     worker.send({ op: 'start', job, adapterPath: frame.adapterPath, resultPath });
@@ -279,13 +326,16 @@ export function createSupervisor({ sessionId, baseDir, idleTimeoutMs = 60000, st
             value = store.ack(frame.eventId, frame.entryId);
             break;
           case 'ping':
-            value = { at: Date.now() };
+            value = { at: Date.now(), storageError: storageError ?? null };
             break;
           default:
             throw new Error('Unsupported mailbox operation');
         }
         send({ id, ok: true, value });
       } catch (error) {
+        if (authenticated && isStorageFailure(error)) {
+          noteStorageFailure(error, frame?.job?.jobId ?? frame?.event?.jobId ?? frame?.jobId);
+        }
         send({ id, ok: false, error: error instanceof Error ? error.message : String(error) });
         if (!authenticated) socket.destroy();
       }

@@ -1,11 +1,14 @@
 {
   "name": "@rodrigojager/pi-agent-mailbox",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "private": true,
   "type": "module",
   "license": "MIT",
   "description": "Durable event mailbox for Pi subagents",
-  "repository": { "type": "git", "url": "https://github.com/rodrigojager/pi-agent-mailbox.git" },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/rodrigojager/pi-agent-mailbox.git"
+  },
   "engines": {
     "node": ">=26"
   },

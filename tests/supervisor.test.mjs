@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, rmSync, readFileSync, mkdirSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, rmSync, readFileSync, mkdirSync, writeFileSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve, basename, dirname } from 'node:path';
 import { randomUUID } from 'node:crypto';
@@ -369,6 +369,87 @@ test('a worker result survives an abrupt supervisor exit on Windows', {
     client?.close();
     await recovered?.close();
     if (child.exitCode === null) child.kill();
+    f.cleanup();
+  }
+});
+
+test('a journal write failure keeps the supervisor alive, blocks new jobs, and recovers the artifact', async () => {
+  const f = fixture();
+  let supervisor;
+  let client;
+  try {
+    const token = ensureToken(f.sessionId, f.baseDir);
+    supervisor = createSupervisor(f);
+    await supervisor.listen();
+    client = await MailboxClient.connect({ ...f, token });
+    const adapterPath = fileURLToPath(new URL('./fake-adapter.mjs', import.meta.url));
+    const healthEvent = new Promise((resolveHealth, reject) => {
+      const timer = setTimeout(() => reject(new Error('Storage failure was not reported')), 8000);
+      client.subscribe(0, event => {
+        if (event.event_type === 'storage_unavailable') {
+          clearTimeout(timer); resolveHealth(event);
+        }
+      }).catch(reject);
+    });
+    const job = { jobId: 'full-journal', coordinatorId: 'root', workflowId: 'flow', delayMs: 250 };
+    await client.request('start', { job, adapterPath });
+    supervisor.store.publish = () => {
+      throw Object.assign(new Error('simulated disk full'), { code: 'SQLITE_FULL' });
+    };
+    const health = await healthEvent;
+    assert.equal(health.job_id, job.jobId);
+    assert.match(health.payload.error, /simulated disk full/);
+    assert.match((await client.request('ping')).storageError, /simulated disk full/);
+    await assert.rejects(client.request('start', {
+      job: { jobId: 'must-not-spawn', coordinatorId: 'root', workflowId: 'flow' }, adapterPath,
+    }), /storage unavailable/);
+    assert.equal((await client.request('job', { jobId: 'must-not-spawn' })), null);
+    client.close();
+    client = undefined;
+    await supervisor.close();
+    supervisor = createSupervisor(f);
+    await supervisor.listen();
+    client = await MailboxClient.connect({ ...f, token });
+    const events = await client.request('events', { after: 0 });
+    assert.equal(events.filter(event => event.event_type === 'terminal').length, 1);
+    assert.equal((await client.request('job', { jobId: job.jobId })).state, 'succeeded');
+  } finally {
+    client?.close();
+    await supervisor?.close();
+    f.cleanup();
+  }
+});
+
+test('a failed started-event commit stops an unstarted worker instead of executing it', async () => {
+  const f = fixture();
+  let supervisor;
+  let client;
+  try {
+    const token = ensureToken(f.sessionId, f.baseDir);
+    supervisor = createSupervisor(f);
+    await supervisor.listen();
+    client = await MailboxClient.connect({ ...f, token });
+    const originalPublish = supervisor.store.publish.bind(supervisor.store);
+    supervisor.store.publish = event => {
+      if (event.eventType === 'started') throw Object.assign(new Error('simulated started commit failure'), { code: 'SQLITE_FULL' });
+      return originalPublish(event);
+    };
+    const job = { jobId: 'never-sent-to-worker', coordinatorId: 'root', workflowId: 'flow' };
+    const adapterPath = fileURLToPath(new URL('./fake-adapter.mjs', import.meta.url));
+    await assert.rejects(client.request('start', { job, adapterPath }), /simulated started commit failure/);
+    assert.match((await client.request('ping')).storageError, /simulated started commit failure/);
+    await new Promise(resolve => setTimeout(resolve, 100));
+    assert.equal(existsSync(join(statePath(f.baseDir, f.sessionId), 'artifacts', `${job.jobId}.json`)), false);
+    assert.equal((await client.request('job', { jobId: job.jobId })).state, 'starting');
+    client.close();
+    client = undefined;
+    await supervisor.close();
+    supervisor = createSupervisor(f);
+    await supervisor.listen();
+    assert.equal(supervisor.store.getJob(job.jobId).state, 'unknown');
+  } finally {
+    client?.close();
+    await supervisor?.close();
     f.cleanup();
   }
 });
