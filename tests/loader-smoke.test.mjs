@@ -6,14 +6,28 @@ import { tmpdir } from 'node:os';
 import { join, resolve, basename } from 'node:path';
 
 const workspace = resolve(import.meta.dirname, '../..');
-const entries = [
-  'pi-agent-mailbox/src/index.ts',
-  'pi-subagent/src/index.ts',
-  'pi-goal-rodrigo/dist/index.ts',
-  'pi-agent-switcher/index.ts',
-  'pi-goal-highlight/index.ts',
-].map(path => join(workspace, path));
-const cli = resolve(import.meta.dirname, '../node_modules/@earendil-works/pi-coding-agent/dist/bundle/cli.js');
+const installedRoot = process.env.PI_MAILBOX_INSTALL_ROOT;
+const useInstalledSettings = process.env.PI_MAILBOX_USE_USER_SETTINGS === '1';
+if (useInstalledSettings && !installedRoot) throw new Error('PI_MAILBOX_INSTALL_ROOT is required for the user-settings smoke');
+const packages = installedRoot
+  ? [
+      'pi-agent-mailbox-v0.1.0/src/index.ts',
+      'pi-subagent-v0.13.0-rodrigo.2/src/index.ts',
+      'pi-goal-v0.54.8-rodrigo.1/dist/index.ts',
+      'pi-agent-switcher-v0.4.0-rodrigo.8/index.ts',
+      'pi-goal-highlight-v1.1.1/index.ts',
+    ]
+  : [
+      'pi-agent-mailbox/src/index.ts',
+      'pi-subagent/src/index.ts',
+      'pi-goal-rodrigo/dist/index.ts',
+      'pi-agent-switcher/index.ts',
+      'pi-goal-highlight/index.ts',
+    ];
+const entries = packages.map(path => join(installedRoot ?? workspace, path));
+const cli = process.env.PI_TEST_PACKAGE
+  ? join(process.env.PI_TEST_PACKAGE, 'dist/bundle/cli.js')
+  : resolve(import.meta.dirname, '../node_modules/@earendil-works/pi-coding-agent/dist/bundle/cli.js');
 
 test('the installed Pi CLI loads all extension entrypoints in an isolated RPC session', {
   skip: (!entries.every(existsSync) || !existsSync(cli)) && 'Run beside all package worktrees and a Pi SDK installation',
@@ -22,12 +36,12 @@ test('the installed Pi CLI loads all extension entrypoints in an isolated RPC se
   const directory = mkdtempSync(join(tmpdir(), 'pi-mailbox-loader-test-'));
   const target = resolve(directory);
   const child = spawn(process.execPath, [
-    cli, '--mode', 'rpc', '--no-session', '--no-extensions', '--no-context-files',
+    cli, '--mode', 'rpc', '--no-session', '--no-context-files',
     '--no-skills', '--no-themes', '--no-prompt-templates',
-    ...entries.flatMap(entry => ['-e', entry]),
+    ...(useInstalledSettings ? [] : ['--no-extensions', ...entries.flatMap(entry => ['-e', entry])]),
   ], {
     cwd: directory,
-    env: { ...process.env, PI_CODING_AGENT_DIR: join(directory, 'agent'), PI_OFFLINE: '1' },
+    env: { ...process.env, PI_CODING_AGENT_DIR: useInstalledSettings ? resolve(installedRoot, '..') : join(directory, 'agent'), PI_OFFLINE: '1' },
     stdio: ['pipe', 'pipe', 'pipe'],
     windowsHide: true,
   });
