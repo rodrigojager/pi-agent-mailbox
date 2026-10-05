@@ -123,6 +123,12 @@ test('a result stays with its branch and ACK follows recorded history', async ()
     assert.match(sent[1].message.content, /Full result artifact:/);
     const artifact = join(statePath(baseDir, sessionId), 'artifacts', `${largeJobId}.json`);
     assert.equal(JSON.parse(readFileSync(artifact, 'utf8')).summary.length, 1200000);
+    await until(() => sent.length === 3, 8000);
+    assert.equal(sent[2].message.details.mailboxEventId, `result:${largeJobId}`, 'an unrecorded result is retried by event ID');
+    assert.equal(supervisor.store.db.prepare('SELECT COUNT(*) AS count FROM events WHERE event_id=?').get(`result:${largeJobId}`).count, 1);
+    branch.push({ id: 'large-history-result', type: 'custom_message', customType: 'subagent-result', details: sent[2].message.details });
+    for (const handler of handlers.get('message_end') ?? []) handler({}, ctx);
+    await until(() => supervisor.store.db.prepare('SELECT state FROM deliveries WHERE event_id=?').get(`result:${largeJobId}`).state === 'recorded');
     for (const handler of handlers.get('session_shutdown') ?? []) handler({}, ctx);
   } finally {
     inspector?.close();
