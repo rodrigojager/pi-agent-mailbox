@@ -227,6 +227,39 @@ test('interrupting a wait releases its subscription without cancelling the job',
   } finally { f.cleanup(); }
 });
 
+test('a one-shot wait timeout does not poll status or cancel its job', async () => {
+  const f = fixture();
+  try {
+    const token = ensureToken(f.sessionId, f.baseDir);
+    const supervisor = createSupervisor(f);
+    await supervisor.listen();
+    const client = await MailboxClient.connect({ ...f, token });
+    await client.request('register', { job: { jobId: 'timeout-continues', coordinatorId: 'root', workflowId: 'flow' } });
+    let statusQueries = 0;
+    const measured = {
+      subscribe: (...args) => client.subscribe(...args),
+      request: (operation, data) => {
+        if (operation === 'wait_status') statusQueries++;
+        return client.request(operation, data);
+      },
+    };
+    const result = await waitForSubagents(measured, {
+      coordinatorId: 'root', workflowId: 'flow', jobIds: ['timeout-continues'], mode: 'all',
+      timeoutMs: 40,
+    });
+    assert.equal(result.timedOut, true);
+    assert.equal(result.interrupted, undefined);
+    assert.equal(statusQueries, 0);
+    assert.equal((await client.request('job', { jobId: 'timeout-continues' })).state, 'registered');
+    await client.request('publish', {
+      event: { eventId: 'after-timeout', jobId: 'timeout-continues', eventType: 'terminal', executionState: 'succeeded' },
+    });
+    assert.equal((await client.request('job', { jobId: 'timeout-continues' })).state, 'succeeded');
+    client.close();
+    await supervisor.close();
+  } finally { f.cleanup(); }
+});
+
 test('a claimed start survives restart without a second execution', async () => {
   const f = fixture();
   let supervisor;
