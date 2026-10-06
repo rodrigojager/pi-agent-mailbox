@@ -11,7 +11,7 @@ const useInstalledSettings = process.env.PI_MAILBOX_USE_USER_SETTINGS === '1';
 if (useInstalledSettings && !installedRoot) throw new Error('PI_MAILBOX_INSTALL_ROOT is required for the user-settings smoke');
 const packages = installedRoot
   ? [
-      'pi-agent-mailbox-v0.1.7/src/index.ts',
+      'pi-agent-mailbox-v0.1.8/src/index.ts',
       'pi-subagent-v0.13.0-rodrigo.5/src/index.ts',
       'pi-goal-v0.54.8-rodrigo.1/dist/index.ts',
       'pi-agent-switcher-v0.4.0-rodrigo.8/index.ts',

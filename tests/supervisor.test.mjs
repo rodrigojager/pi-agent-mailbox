@@ -597,6 +597,51 @@ test('startup retention removes an acknowledged artifact and preserves a pending
   }
 });
 
+test('startup retention drains more than one batch while IPC and checkpoint remain available', async () => {
+  const f = fixture();
+  let supervisor;
+  let client;
+  try {
+    const token = ensureToken(f.sessionId, f.baseDir);
+    const directory = statePath(f.baseDir, f.sessionId);
+    mkdirSync(join(directory, 'artifacts'));
+    const store = new MailboxStore(join(directory, 'journal.sqlite'));
+    for (let index = 0; index < 1005; index++) {
+      const jobId = `retained-${index}`;
+      const eventId = `${jobId}-terminal`;
+      store.registerJob({ jobId, coordinatorId: 'root', workflowId: 'flow' });
+      store.publish({ eventId, jobId, eventType: 'terminal', executionState: 'succeeded' });
+      store.ack(eventId, `history-${index}`);
+    }
+    for (const index of [0, 1004]) {
+      writeFileSync(join(directory, 'artifacts', `retained-${index}.json`), JSON.stringify({ state: 'succeeded' }));
+    }
+    const old = Date.now() - 10000;
+    store.db.prepare('UPDATE jobs SET updated_at=?').run(old);
+    store.db.prepare('UPDATE deliveries SET recorded_at=?').run(old);
+    store.close();
+
+    supervisor = createSupervisor({ ...f, retentionMs: 1000 });
+    await supervisor.listen();
+    client = await MailboxClient.connect({ ...f, token });
+    assert.equal((await client.request('ping')).storageError, null);
+    const deadline = Date.now() + 10000;
+    while (supervisor.store.db.prepare('SELECT COUNT(*) AS n FROM events').get().n > 0 && Date.now() < deadline) {
+      await new Promise(resolve => setTimeout(resolve, 25));
+    }
+    assert.equal(supervisor.store.db.prepare('SELECT COUNT(*) AS n FROM events').get().n, 0);
+    assert.equal(supervisor.store.db.prepare('SELECT COUNT(*) AS n FROM jobs').get().n, 1005);
+    assert.equal(existsSync(join(directory, 'artifacts', 'retained-0.json')), false);
+    assert.equal(existsSync(join(directory, 'artifacts', 'retained-1004.json')), false);
+    assert.equal(supervisor.store.checkpoint().busy, 0);
+    assert.equal((await client.request('ping')).storageError, null);
+  } finally {
+    client?.close();
+    await supervisor?.close();
+    f.cleanup();
+  }
+});
+
 test('a locked journal defers retention without deleting a confirmed result', () => {
   const f = fixture();
   let store;

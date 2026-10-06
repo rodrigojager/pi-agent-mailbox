@@ -12,6 +12,7 @@ const MAX_SOCKET_BACKLOG_BYTES = 4 * 1024 * 1024;
 const DROP_EPHEMERAL_AT_BYTES = 512 * 1024;
 const EPHEMERAL_EVENTS = new Set(['progress', 'heartbeat', 'suspected_stall']);
 const RETENTION_INTERVAL_MS = 24 * 60 * 60 * 1000;
+const RETENTION_BATCH_LIMIT = 1000;
 
 function sameToken(left, right) {
   if (typeof left !== 'string' || typeof right !== 'string') return false;
@@ -50,6 +51,7 @@ export function createSupervisor({ sessionId, baseDir, idleTimeoutMs = 60000, st
   let closed = false;
   let storageError;
   let maintenanceWarning;
+  let maintenanceContinuation;
   let idleTimer;
   const clearIdle = () => {
     if (idleTimer) clearTimeout(idleTimer);
@@ -97,8 +99,10 @@ export function createSupervisor({ sessionId, baseDir, idleTimeoutMs = 60000, st
   }
 
   function maintainJournal() {
+    let moreCandidates = false;
     if (retentionMs > 0) {
-      const { jobIds } = store.pruneRecorded(Date.now() - retentionMs);
+      const { jobIds } = store.pruneRecorded(Date.now() - retentionMs, RETENTION_BATCH_LIMIT);
+      moreCandidates = jobIds.length === RETENTION_BATCH_LIMIT;
       for (const jobId of jobIds) {
         if (!/^[a-zA-Z0-9_-]{1,128}$/.test(jobId)) continue;
         try { unlinkSync(join(artifactDir, `${jobId}.json`)); }
@@ -109,11 +113,18 @@ export function createSupervisor({ sessionId, baseDir, idleTimeoutMs = 60000, st
     }
     const checkpoint = store.checkpoint();
     if (checkpoint?.busy) maintenanceWarning = 'Mailbox WAL checkpoint is busy';
+    if (moreCandidates && !closed) {
+      maintenanceContinuation = setImmediate(() => {
+        maintenanceContinuation = undefined;
+        runMaintenance(true);
+      });
+    }
   }
 
-  function runMaintenance() {
+  function runMaintenance(continuing = false) {
+    if (closed || storageError || maintenanceContinuation) return;
     try {
-      maintenanceWarning = undefined;
+      if (!continuing) maintenanceWarning = undefined;
       maintainJournal();
     } catch (error) {
       if (isTransientLock(error)) {
@@ -439,6 +450,7 @@ export function createSupervisor({ sessionId, baseDir, idleTimeoutMs = 60000, st
       clearIdle();
       clearInterval(heartbeat);
       clearInterval(maintenanceTimer);
+      if (maintenanceContinuation) clearImmediate(maintenanceContinuation);
       for (const jobId of stallTimers.keys()) clearStall(jobId);
       artifactWatcher.close();
       for (const socket of sockets) socket.destroy();
