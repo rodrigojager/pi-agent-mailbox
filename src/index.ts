@@ -44,6 +44,9 @@ export default function registerAgentMailbox(pi: ExtensionAPI, options: { baseDi
   const inFlight = new Set<string>();
   const deliveryAttempts = new Map<string, number>();
   const deliveryChecks = new Map<string, ReturnType<typeof setTimeout>>();
+  const ackPending = new Map<string, MailboxClient>();
+  const ackAttempts = new Map<string, number>();
+  const ackChecks = new Map<string, ReturnType<typeof setTimeout>>();
   let goalBinding: GoalBinding | undefined;
 
   const setHealth = (ctx: ExtensionContext, state: 'responsive' | 'disconnected' | 'suspected_stall' | 'observer' | 'storage_unavailable') => {
@@ -95,6 +98,10 @@ export default function registerAgentMailbox(pi: ExtensionAPI, options: { baseDi
     deliveryAttempts.clear();
     for (const timer of deliveryChecks.values()) clearTimeout(timer);
     deliveryChecks.clear();
+    ackPending.clear();
+    ackAttempts.clear();
+    for (const timer of ackChecks.values()) clearTimeout(timer);
+    ackChecks.clear();
     goalBinding = undefined;
   };
 
@@ -127,7 +134,7 @@ export default function registerAgentMailbox(pi: ExtensionAPI, options: { baseDi
     );
 
   const ackRecorded = (ctx: ExtensionContext, eventId: string) => {
-    if (!client || connectedSession !== ctx.sessionManager.getSessionId()) return;
+    if (!client?.isOwner || connectedSession !== ctx.sessionManager.getSessionId()) return;
     const entry = historyEntryFor(ctx, eventId);
     if (!entry) return;
     inFlight.delete(eventId);
@@ -135,7 +142,28 @@ export default function registerAgentMailbox(pi: ExtensionAPI, options: { baseDi
     const timer = deliveryChecks.get(eventId);
     if (timer) clearTimeout(timer);
     deliveryChecks.delete(eventId);
-    void client.request('ack', { eventId, entryId: entry.id }).catch(() => {});
+    if (ackPending.has(eventId)) return;
+    const retry = ackChecks.get(eventId);
+    if (retry) clearTimeout(retry);
+    ackChecks.delete(eventId);
+    const opened = client;
+    ackPending.set(eventId, opened);
+    void opened.request('ack', { eventId, entryId: entry.id }).then(() => {
+      if (client === opened) ackAttempts.delete(eventId);
+    }).catch(() => {
+      if (client !== opened || currentContext !== ctx || connectedSession !== ctx.sessionManager.getSessionId()) return;
+      const attempts = (ackAttempts.get(eventId) ?? 0) + 1;
+      ackAttempts.set(eventId, attempts);
+      const delay = Math.min(60000, 1000 * 2 ** Math.min(attempts - 1, 6));
+      const scheduled = setTimeout(() => {
+        ackChecks.delete(eventId);
+        ackRecorded(ctx, eventId);
+      }, delay);
+      scheduled.unref?.();
+      ackChecks.set(eventId, scheduled);
+    }).finally(() => {
+      if (ackPending.get(eventId) === opened) ackPending.delete(eventId);
+    });
   };
 
   const scheduleDeliveryCheck = (ctx: ExtensionContext, eventIds: string[]) => {

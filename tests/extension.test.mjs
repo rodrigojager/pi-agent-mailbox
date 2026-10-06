@@ -201,6 +201,63 @@ test('a failed Pi message enqueue retries the committed result before acknowledg
   }
 });
 
+test('a transient ACK failure retries without sending the recorded result again', async () => {
+  const baseDir = mkdtempSync(join(tmpdir(), 'pi-mailbox-extension-test-'));
+  const target = resolve(baseDir);
+  const sessionId = randomUUID();
+  const workflowId = randomUUID();
+  const jobId = randomUUID();
+  const eventId = `result:${jobId}`;
+  const branch = [{ id: 'workflow', type: 'custom', customType: 'mailbox-workflow',
+    data: { id: workflowId, sessionId } }];
+  const handlers = new Map();
+  const sent = [];
+  let attempts = 0;
+  let supervisor;
+  try {
+    ensureToken(sessionId, baseDir);
+    supervisor = createSupervisor({ sessionId, baseDir });
+    await supervisor.listen();
+    const originalAck = supervisor.store.ack.bind(supervisor.store);
+    supervisor.store.ack = (id, entryId) => {
+      attempts++;
+      if (attempts === 1) throw new Error('transient ACK failure');
+      return originalAck(id, entryId);
+    };
+    const ctx = { hasUI: false, ui: { setStatus() {}, notify() {} },
+      sessionManager: { getSessionId: () => sessionId, getBranch: () => branch } };
+    const pi = {
+      events: new EventEmitter(),
+      on(name, handler) { handlers.set(name, [...(handlers.get(name) ?? []), handler]); },
+      appendEntry(customType, data) { branch.push({ id: randomUUID(), type: 'custom', customType, data }); },
+      sendMessage(message, options) { sent.push({ message, options }); },
+      registerCommand() {}, registerTool() {},
+    };
+    registerAgentMailbox(pi, { baseDir });
+    for (const handler of handlers.get('session_start') ?? []) handler({}, ctx);
+    await until(() => supervisor.ownerPresent());
+    supervisor.store.registerJob({ jobId, coordinatorId: sessionId, workflowId });
+    supervisor.publish({ eventId, jobId, eventType: 'terminal', executionState: 'succeeded',
+      payload: { summary: 'result recorded before ACK retry' } });
+    await until(() => sent.length === 1);
+    branch.push({ id: 'recorded-before-retry', type: 'custom_message', customType: 'subagent-result',
+      details: sent[0].message.details });
+    for (const handler of handlers.get('message_end') ?? []) handler({}, ctx);
+    await until(() => supervisor.store.db.prepare('SELECT state FROM deliveries WHERE event_id=?')
+      .get(eventId)?.state === 'recorded', 5000);
+    assert.equal(attempts, 2);
+    assert.equal(sent.length, 1);
+    assert.equal(supervisor.store.db.prepare('SELECT entry_id FROM deliveries WHERE event_id=?')
+      .get(eventId).entry_id, 'recorded-before-retry');
+    for (const handler of handlers.get('session_shutdown') ?? []) handler({}, ctx);
+  } finally {
+    await supervisor?.close();
+    if (!target.startsWith(resolve(tmpdir()) + '\\') && !target.startsWith(resolve(tmpdir()) + '/')) throw new Error('Refusing to delete outside temp');
+    if (!basename(target).startsWith('pi-mailbox-extension-test-')) throw new Error('Unexpected fixture name');
+    rmSync(target, { recursive: true, force: true });
+  }
+});
+
 test('fork and ancestor navigation keep pending results owned by the original branch', async () => {
   const baseDir = mkdtempSync(join(tmpdir(), 'pi-mailbox-extension-test-'));
   const target = resolve(baseDir);
