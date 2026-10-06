@@ -1,17 +1,18 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
-import { existsSync, mkdtempSync, rmSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve, basename } from 'node:path';
 
 const workspace = resolve(import.meta.dirname, '../..');
 const installedRoot = process.env.PI_MAILBOX_INSTALL_ROOT;
+const { version } = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8'));
 const useInstalledSettings = process.env.PI_MAILBOX_USE_USER_SETTINGS === '1';
 if (useInstalledSettings && !installedRoot) throw new Error('PI_MAILBOX_INSTALL_ROOT is required for the user-settings smoke');
 const packages = installedRoot
   ? [
-      'pi-agent-mailbox-v0.1.15/src/index.ts',
+      `pi-agent-mailbox-v${version}/src/index.ts`,
       'pi-subagent-v0.13.0-rodrigo.5/src/index.ts',
       'pi-goal-v0.54.8-rodrigo.1/dist/index.ts',
       'pi-agent-switcher-v0.4.0-rodrigo.8/index.ts',

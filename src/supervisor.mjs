@@ -1,4 +1,5 @@
 import { connect, createServer } from 'node:net';
+import { DatabaseSync } from 'node:sqlite';
 import { readFileSync, existsSync, lstatSync, mkdirSync, unlinkSync, watch } from 'node:fs';
 import { join, isAbsolute } from 'node:path';
 import { timingSafeEqual, createHash } from 'node:crypto';
@@ -74,9 +75,9 @@ export function createSupervisor({ sessionId, baseDir, idleTimeoutMs = 60000, st
   }
   const directory = statePath(baseDir, sessionId);
   const token = readFileSync(join(directory, 'token'), 'utf8').trim();
-  const store = new MailboxStore(join(directory, 'journal.sqlite'));
   const artifactDir = join(directory, 'artifacts');
-  mkdirSync(artifactDir, { recursive: true, mode: 0o700 });
+  let store;
+  let artifactWatcher;
   const subscribers = new Set();
   const sockets = new Set();
   const workers = new Map();
@@ -174,7 +175,6 @@ export function createSupervisor({ sessionId, baseDir, idleTimeoutMs = 60000, st
     }
   }
 
-  runMaintenance();
   const maintenanceTimer = setInterval(() => {
     if (closed || storageError) return;
     runMaintenance();
@@ -238,7 +238,7 @@ export function createSupervisor({ sessionId, baseDir, idleTimeoutMs = 60000, st
     }
   }
 
-  const artifactWatcher = watch(artifactDir, (_kind, filename) => {
+  const watchArtifacts = () => watch(artifactDir, (_kind, filename) => {
     if (closed) return;
     if (filename && /^[a-zA-Z0-9_-]{1,128}\.json$/.test(filename)) {
       reconcileArtifact(filename.slice(0, -5));
@@ -335,7 +335,6 @@ export function createSupervisor({ sessionId, baseDir, idleTimeoutMs = 60000, st
     return { job: store.getJob(job.jobId), duplicate: false };
   }
 
-  recoverOpenJobs();
   const server = createServer(socket => {
     clearIdle();
     sockets.add(socket);
@@ -467,12 +466,16 @@ export function createSupervisor({ sessionId, baseDir, idleTimeoutMs = 60000, st
   });
   return {
     endpoint: endpointFor(sessionId, baseDir),
-    store,
+    get store() { return store; },
     publish: publishAndNotify,
     ownerPresent: () => Boolean(ownerSocket && !ownerSocket.destroyed),
     maxSocketBacklogBytes: () => Math.max(0, ...[...sockets].map(socket => socket.writableLength)),
     async listen() {
       const endpoint = endpointFor(sessionId, baseDir);
+      // SQLite releases this OS lock even after an abrupt process exit. Keep
+      // it through endpoint binding and journal recovery so a second starter
+      // cannot probe or unlink a newly bound Unix socket.
+      let startupDb;
       const bind = () => new Promise((resolve, reject) => {
         const onError = error => { server.off('error', onError); reject(error); };
         server.once('error', onError);
@@ -482,18 +485,30 @@ export function createSupervisor({ sessionId, baseDir, idleTimeoutMs = 60000, st
           resolve();
         });
       });
-      try { await bind(); }
-      catch (error) {
-        try {
+      try {
+        startupDb = new DatabaseSync(join(directory, 'startup-lock.sqlite'), { timeout: 5000 });
+        startupDb.exec('BEGIN IMMEDIATE');
+        try { await bind(); }
+        catch (error) {
           if (process.platform !== 'win32' && error.code === 'EADDRINUSE') {
             const state = await staleUnixSocket(endpoint);
             if (state === 'active') throw error;
             await bind();
           } else throw error;
-        } catch (failure) {
-          await this.close();
-          throw failure;
         }
+        // Only the process that owns the endpoint may reconcile open jobs or
+        // prune the journal. A losing startup must leave live workers alone.
+        store = new MailboxStore(join(directory, 'journal.sqlite'));
+        mkdirSync(artifactDir, { recursive: true, mode: 0o700 });
+        artifactWatcher = watchArtifacts();
+        recoverOpenJobs();
+        runMaintenance();
+      } catch (error) {
+        await this.close();
+        throw error;
+      } finally {
+        try { startupDb?.exec('ROLLBACK'); } catch { /* Lock may never have been acquired. */ }
+        startupDb?.close();
       }
     },
     async close() {
@@ -504,10 +519,10 @@ export function createSupervisor({ sessionId, baseDir, idleTimeoutMs = 60000, st
       clearInterval(maintenanceTimer);
       if (maintenanceContinuation) clearImmediate(maintenanceContinuation);
       for (const jobId of stallTimers.keys()) clearStall(jobId);
-      artifactWatcher.close();
+      artifactWatcher?.close();
       for (const socket of sockets) socket.destroy();
       await new Promise(resolve => server.close(resolve));
-      store.close();
+      store?.close();
     },
   };
 }

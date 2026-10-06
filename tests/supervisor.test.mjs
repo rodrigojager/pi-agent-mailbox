@@ -133,6 +133,87 @@ test('Unix stale endpoint recovery leaves a live supervisor and non-socket files
   }
 });
 
+test('a losing supervisor startup cannot reconcile a worker owned by the live supervisor', async () => {
+  const f = fixture();
+  let first;
+  let second;
+  let client;
+  try {
+    const token = ensureToken(f.sessionId, f.baseDir);
+    first = createSupervisor(f);
+    await first.listen();
+    client = await MailboxClient.connect({ ...f, token });
+    const job = { jobId: 'owned-worker', coordinatorId: 'root', workflowId: 'flow', delayMs: 1200 };
+    const adapterPath = fileURLToPath(new URL('./fake-adapter.mjs', import.meta.url));
+    await client.request('start', { job, adapterPath });
+    assert.equal((await client.request('job', { jobId: job.jobId })).state, 'running');
+
+    second = createSupervisor(f);
+    assert.equal((await client.request('job', { jobId: job.jobId })).state, 'running');
+    await assert.rejects(second.listen(), { code: 'EADDRINUSE' });
+    assert.equal((await client.request('job', { jobId: job.jobId })).state, 'running');
+    assert.equal((await client.request('events', { after: 0 })).some(event =>
+      event.event_type === 'supervision_lost'), false);
+
+    const deadline = Date.now() + 8000;
+    while ((await client.request('job', { jobId: job.jobId })).state !== 'succeeded' && Date.now() < deadline) {
+      await new Promise(resolve => setTimeout(resolve, 25));
+    }
+    assert.equal((await client.request('job', { jobId: job.jobId })).state, 'succeeded');
+  } finally {
+    client?.close();
+    await second?.close();
+    await first?.close();
+    f.cleanup();
+  }
+});
+
+test('two processes racing to recover a stale Unix socket leave one reachable supervisor', {
+  skip: process.platform === 'win32', timeout: 15000,
+}, async () => {
+  const f = fixture();
+  const children = [];
+  let client;
+  try {
+    const token = ensureToken(f.sessionId, f.baseDir);
+    const crashFixture = fileURLToPath(new URL('./fake-commit-crash.mjs', import.meta.url));
+    const crashed = spawnSync(process.execPath, [crashFixture, f.sessionId, f.baseDir], {
+      windowsHide: true, timeout: 10000, encoding: 'utf8',
+    });
+    assert.equal(crashed.status, 9, crashed.stderr);
+    const starter = fileURLToPath(new URL('./fake-supervisor-start.mjs', import.meta.url));
+    const started = () => {
+      const child = spawn(process.execPath, [starter, f.sessionId, f.baseDir], {
+        stdio: ['ignore', 'ignore', 'ignore', 'ipc'], windowsHide: true,
+      });
+      children.push(child);
+      return new Promise((resolveStart, rejectStart) => {
+        child.once('message', resolveStart);
+        child.once('error', rejectStart);
+        child.once('exit', code => rejectStart(new Error(`Supervisor exited before reporting: ${code}`)));
+      });
+    };
+    const states = await Promise.all([started(), started()]);
+    assert.deepEqual(states.map(value => value.state).sort(), ['failed', 'listening'], JSON.stringify(states));
+    client = await MailboxClient.connect({ ...f, token });
+    assert.ok((await client.request('ping')).at);
+    assert.deepEqual((await client.request('events', { after: 0 })).map(event => event.event_id),
+      ['committed-without-notify']);
+  } finally {
+    client?.close();
+    for (const child of children) {
+      if (child.exitCode !== null) continue;
+      if (child.connected) child.send('stop');
+      const exited = await new Promise(resolveExit => {
+        const timer = setTimeout(() => resolveExit(false), 2000);
+        child.once('exit', () => { clearTimeout(timer); resolveExit(true); });
+      });
+      if (!exited) child.kill();
+    }
+    f.cleanup();
+  }
+});
+
 test('subscription sees results published after its replay and rejects wrong identity', async () => {
   const f = fixture();
   try {
@@ -937,7 +1018,8 @@ test('an idle supervisor can exit only after disconnected workers finish', async
   try {
     const token = ensureToken(f.sessionId, f.baseDir);
     let idleCalls = 0;
-    supervisor = createSupervisor({ ...f, idleTimeoutMs: 40, onIdle: () => { idleCalls++; } });
+    let disconnected = false;
+    supervisor = createSupervisor({ ...f, idleTimeoutMs: 40, onIdle: () => { if (disconnected) idleCalls++; } });
     await supervisor.listen();
     client = await MailboxClient.connect({ ...f, token });
     const adapterPath = fileURLToPath(new URL('./fake-adapter.mjs', import.meta.url));
@@ -946,6 +1028,7 @@ test('an idle supervisor can exit only after disconnected workers finish', async
     });
     client.close();
     client = undefined;
+    disconnected = true;
     await new Promise(resolve => setTimeout(resolve, 90));
     assert.equal(idleCalls, 0);
     const deadline = Date.now() + 8000;
