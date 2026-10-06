@@ -8,7 +8,7 @@ The coordinator registers a job before the supervisor starts a child. A Node wor
 
 Retention removes only acknowledged results with no active wait. Startup and daily cleanup process old jobs in bounded batches, yielding to IPC between batches; a checkpoint runs after each batch.
 
-The journal lives under `~/.pi/agent/state/pi-agent-mailbox/v1/<session-hash>/`. Large results are separate, hashed artifacts. The worker and supervisor use the installed Node executable; Node 26 or newer is required for `node:sqlite`. The supervisor stops after its clients disconnect and its workers finish, while the journal remains for recovery.
+The journal lives under `~/.pi/agent/state/pi-agent-mailbox/v1/<session-hash>/`. Large results are separate, hashed artifacts. The worker and supervisor use the installed Node executable; Node 26 or newer is required for `node:sqlite`. The supervisor stops after its clients disconnect and its workers finish, while the journal remains for recovery. On Unix, a crash may leave the socket pathname behind; a new supervisor probes it and removes it only if it is still a socket and refuses connections. An active endpoint or another file is preserved.
 
 ## Install and activate
 

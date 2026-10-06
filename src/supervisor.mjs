@@ -1,5 +1,5 @@
-import { createServer } from 'node:net';
-import { readFileSync, existsSync, mkdirSync, unlinkSync, watch } from 'node:fs';
+import { connect, createServer } from 'node:net';
+import { readFileSync, existsSync, lstatSync, mkdirSync, unlinkSync, watch } from 'node:fs';
 import { join, isAbsolute } from 'node:path';
 import { timingSafeEqual, createHash } from 'node:crypto';
 import { fork } from 'node:child_process';
@@ -30,6 +30,41 @@ function isStorageFailure(error) {
 function isTransientLock(error) {
   return ['SQLITE_BUSY', 'SQLITE_LOCKED', 'ERR_SQLITE_ERROR'].includes(error?.code)
     && /database (?:is )?locked|database is busy/i.test(error?.message ?? '');
+}
+
+async function staleUnixSocket(endpoint) {
+  let original;
+  try { original = lstatSync(endpoint); }
+  catch (error) {
+    if (error.code === 'ENOENT') return 'gone';
+    throw error;
+  }
+  if (!original.isSocket()) throw new Error('Mailbox endpoint exists but is not a Unix socket');
+  const state = await new Promise((resolve, reject) => {
+    const probe = connect(endpoint);
+    probe.setTimeout(500);
+    probe.once('connect', () => { probe.destroy(); resolve('active'); });
+    probe.once('error', error => {
+      probe.destroy();
+      if (error.code === 'ECONNREFUSED') resolve('stale');
+      else if (error.code === 'ENOENT') resolve('gone');
+      else reject(error);
+    });
+    probe.once('timeout', () => { probe.destroy(); reject(new Error('Mailbox endpoint probe timed out')); });
+  });
+  if (state !== 'stale') return state;
+  let current;
+  try { current = lstatSync(endpoint); }
+  catch (error) {
+    if (error.code === 'ENOENT') return 'gone';
+    throw error;
+  }
+  if (!current.isSocket() || current.dev !== original.dev || current.ino !== original.ino) {
+    throw new Error('Mailbox endpoint changed during stale socket recovery');
+  }
+  try { unlinkSync(endpoint); }
+  catch (error) { if (error.code !== 'ENOENT') throw error; }
+  return 'removed';
 }
 
 export function createSupervisor({ sessionId, baseDir, idleTimeoutMs = 60000, stallTimeoutMs = 300000,
@@ -437,14 +472,29 @@ export function createSupervisor({ sessionId, baseDir, idleTimeoutMs = 60000, st
     ownerPresent: () => Boolean(ownerSocket && !ownerSocket.destroyed),
     maxSocketBacklogBytes: () => Math.max(0, ...[...sockets].map(socket => socket.writableLength)),
     async listen() {
-      await new Promise((resolve, reject) => {
-        server.once('error', reject);
-        server.listen(endpointFor(sessionId, baseDir), () => {
-          server.off('error', reject);
+      const endpoint = endpointFor(sessionId, baseDir);
+      const bind = () => new Promise((resolve, reject) => {
+        const onError = error => { server.off('error', onError); reject(error); };
+        server.once('error', onError);
+        server.listen(endpoint, () => {
+          server.off('error', onError);
           scheduleIdle();
           resolve();
         });
       });
+      try { await bind(); }
+      catch (error) {
+        try {
+          if (process.platform !== 'win32' && error.code === 'EADDRINUSE') {
+            const state = await staleUnixSocket(endpoint);
+            if (state === 'active') throw error;
+            await bind();
+          } else throw error;
+        } catch (failure) {
+          await this.close();
+          throw failure;
+        }
+      }
     },
     async close() {
       if (closed) return;

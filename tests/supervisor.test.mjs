@@ -7,11 +7,11 @@ import { randomUUID } from 'node:crypto';
 import { createHash } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { DatabaseSync } from 'node:sqlite';
-import { spawn } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import { createSupervisor } from '../src/supervisor.mjs';
 import { MailboxClient, ensureToken } from '../src/client.mjs';
 import { MailboxStore } from '../src/store.mjs';
-import { statePath } from '../src/protocol.mjs';
+import { endpointFor, statePath } from '../src/protocol.mjs';
 import { waitForSubagents } from '../src/wait.mjs';
 
 function fixture() {
@@ -72,6 +72,65 @@ test('terminal event and pending delivery survive a supervisor restart', async (
       await supervisor.close();
     }
   } finally { f.cleanup(); }
+});
+
+test('a supervisor crash after SQLite commit but before IPC notification replays the terminal', async () => {
+  const f = fixture();
+  let supervisor;
+  let client;
+  try {
+    const token = ensureToken(f.sessionId, f.baseDir);
+    const crashFixture = fileURLToPath(new URL('./fake-commit-crash.mjs', import.meta.url));
+    const crashed = spawnSync(process.execPath, [crashFixture, f.sessionId, f.baseDir], {
+      windowsHide: true, timeout: 10000, encoding: 'utf8',
+    });
+    assert.equal(crashed.status, 9, crashed.stderr);
+    supervisor = createSupervisor(f);
+    await supervisor.listen();
+    client = await MailboxClient.connect({ ...f, token });
+    const seen = [];
+    await client.subscribe(0, event => seen.push(event));
+    assert.deepEqual(seen.map(event => event.event_id), ['committed-without-notify']);
+    assert.equal(seen[0].event_type, 'terminal');
+    assert.equal(seen[0].payload.summary, 'durable before IPC publication');
+    assert.equal((await client.request('job', { jobId: 'commit-before-notify' })).state, 'succeeded');
+  } finally {
+    client?.close();
+    await supervisor?.close();
+    f.cleanup();
+  }
+});
+
+test('Unix stale endpoint recovery leaves a live supervisor and non-socket files intact', {
+  skip: process.platform === 'win32',
+}, async () => {
+  const f = fixture();
+  let first;
+  let second;
+  let client;
+  try {
+    const token = ensureToken(f.sessionId, f.baseDir);
+    first = createSupervisor(f);
+    await first.listen();
+    second = createSupervisor(f);
+    await assert.rejects(second.listen(), { code: 'EADDRINUSE' });
+    client = await MailboxClient.connect({ ...f, token });
+    assert.ok((await client.request('ping')).at);
+    client.close();
+    client = undefined;
+    await first.close();
+    first = undefined;
+    const endpoint = endpointFor(f.sessionId, f.baseDir);
+    writeFileSync(endpoint, 'keep-this-file');
+    const third = createSupervisor(f);
+    await assert.rejects(third.listen(), /not a Unix socket/);
+    assert.equal(readFileSync(endpoint, 'utf8'), 'keep-this-file');
+  } finally {
+    client?.close();
+    await second?.close();
+    await first?.close();
+    f.cleanup();
+  }
 });
 
 test('subscription sees results published after its replay and rejects wrong identity', async () => {
