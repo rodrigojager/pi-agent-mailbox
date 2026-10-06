@@ -80,7 +80,7 @@ test('real pi-goal goal_wait arms the mailbox bridge and one completion wakes th
   }
 });
 
-test('real /goal pause delivers a late mailbox result without resuming the model', {
+test('real /goal pause and resume do not wake a newer goal with old mailbox results', {
   skip: (!existsSync(goalSource) || !existsSync(mockSource)) && 'Run beside a pi-goal source checkout',
   timeout: 90000,
 }, async () => {
@@ -115,7 +115,9 @@ test('real /goal pause delivers a late mailbox result without resuming the model
     const goalId = branch().findLast(entry => entry.customType === 'goal-state')?.data?.goal?.id;
     assert.ok(goalId);
     const jobId = randomUUID();
+    const resumedLateJobId = randomUUID();
     supervisor.store.registerJob({ jobId, coordinatorId: sessionId, workflowId, goalId });
+    supervisor.store.registerJob({ jobId: resumedLateJobId, coordinatorId: sessionId, workflowId, goalId });
     const waitTool = mock.tools.find(tool => tool.name === 'goal_wait');
     const wait = await waitTool.execute('goal-pause-test', {
       goal_id: goalId, reason: 'Waiting for the offline child',
@@ -134,6 +136,19 @@ test('real /goal pause delivers a late mailbox result without resuming the model
     assert.equal(results.length, 1);
     assert.equal(results[0].options?.triggerTurn, false);
     assert.match(results[0].message.content, /finished after pause/);
+    await mock.commands.get('goal').handler('resume', context.ctx);
+    const resumedGoal = branch().findLast(entry => entry.customType === 'goal-state')?.data?.goal;
+    assert.equal(resumedGoal?.status, 'active');
+    assert.notEqual(resumedGoal.id, goalId);
+    supervisor.publish({ eventId: 'late-old-goal-result', jobId: resumedLateJobId, eventType: 'terminal',
+      executionState: 'succeeded', payload: { summary: 'offline child belongs to old goal' } });
+    while (mock.sentMessages.filter(item => item.message?.customType === 'subagent-result').length < 2 && Date.now() < deadline + 5000) {
+      await new Promise(resolve => setTimeout(resolve, 10));
+    }
+    const allResults = mock.sentMessages.filter(item => item.message?.customType === 'subagent-result');
+    assert.equal(allResults.length, 2);
+    assert.equal(allResults[1].options?.triggerTurn, false);
+    assert.match(allResults[1].message.content, /belongs to old goal/);
     for (const handler of mock.events.get('session_shutdown') ?? []) await handler({}, context.ctx);
   } finally {
     await supervisor?.close();
