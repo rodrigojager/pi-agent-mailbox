@@ -139,6 +139,42 @@ test('a job registered before an abrupt supervisor exit can start once after rec
   }
 });
 
+test('a worker exit after computing a result but before persisting it reports the failure once without rerun', async () => {
+  const f = fixture();
+  let supervisor;
+  let client;
+  try {
+    const token = ensureToken(f.sessionId, f.baseDir);
+    supervisor = createSupervisor(f);
+    await supervisor.listen();
+    client = await MailboxClient.connect({ ...f, token });
+    const markerPath = join(f.baseDir, 'execution-marker.txt');
+    const job = { jobId: 'result-in-memory-crash', coordinatorId: 'root', workflowId: 'flow', markerPath };
+    const adapterPath = fileURLToPath(new URL('./fake-result-memory-crash.mjs', import.meta.url));
+    const final = new Promise((resolveTerminal, reject) => {
+      const timer = setTimeout(() => reject(new Error('Worker exit was not reported')), 8000);
+      client.subscribe(0, event => {
+        if (event.job_id !== job.jobId || event.event_type !== 'worker_exit') return;
+        clearTimeout(timer);
+        resolveTerminal(event);
+      }).catch(reject);
+    });
+    assert.equal((await client.request('start', { job, adapterPath })).duplicate, false);
+    const terminal = await final;
+    assert.equal(terminal.payload.code, 9);
+    assert.equal((await client.request('job', { jobId: job.jobId })).state, 'failed');
+    assert.equal((await client.request('start', { job, adapterPath })).duplicate, true);
+    assert.equal(readFileSync(markerPath, 'utf8'), 'executed\n');
+    const events = await client.request('events', { after: 0 });
+    assert.equal(events.filter(event => event.event_type === 'worker_exit').length, 1);
+    assert.equal(events.filter(event => event.event_type === 'terminal').length, 0);
+  } finally {
+    client?.close();
+    await supervisor?.close();
+    f.cleanup();
+  }
+});
+
 test('Unix stale endpoint recovery leaves a live supervisor and non-socket files intact', {
   skip: process.platform === 'win32',
 }, async () => {
