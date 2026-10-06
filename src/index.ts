@@ -234,20 +234,31 @@ export default function registerAgentMailbox(pi: ExtensionAPI, options: { baseDi
     if (!binding.settled && waitingGoalId(ctx) === binding.goalId) return;
     binding.flushing = true;
     try {
-      if (waitingGoalId(ctx) !== binding.goalId) {
-        const events = await client.request('wait_results', { waitId: binding.waitId }) as MailboxEvent[];
-        await client.request('cancel_wait', { waitId: binding.waitId });
+      const drainClearedWait = async (knownEvents?: MailboxEvent[]) => {
+        const events = knownEvents ?? await client!.request('wait_results', { waitId: binding.waitId }) as MailboxEvent[];
+        await client!.request('cancel_wait', { waitId: binding.waitId });
         if (goalBinding === binding) goalBinding = undefined;
         for (const event of events) await deliver(event);
+      };
+      if (waitingGoalId(ctx) !== binding.goalId) {
+        await drainClearedWait();
         return;
       }
       const status = await client.request('wait_status', { waitId: binding.waitId });
+      if (waitingGoalId(ctx) !== binding.goalId) {
+        await drainClearedWait();
+        return;
+      }
       pi.events.emit(MAILBOX_WAIT_ACTIVITY_CHANNEL, {
         sessionId: binding.sessionId, goalId: binding.goalId, waitId: binding.waitId,
         statuses: status?.statuses, ready: status?.ready,
       });
       if (!status?.ready) return;
       const events = await client.request('wait_results', { waitId: binding.waitId }) as MailboxEvent[];
+      if (waitingGoalId(ctx) !== binding.goalId) {
+        await drainClearedWait(events);
+        return;
+      }
       const pending = events.filter(event => !historyEntryFor(ctx, event.event_id));
       if (!pending.length) {
         await client.request('cancel_wait', { waitId: binding.waitId });
@@ -265,6 +276,12 @@ export default function registerAgentMailbox(pi: ExtensionAPI, options: { baseDi
           const records = (result.details as { results?: unknown[] }).results;
           if (Array.isArray(records)) results.push(...records);
         }
+      }
+      if (waitingGoalId(ctx) !== binding.goalId) {
+        await drainClearedWait(events);
+        return;
+      }
+      for (const event of pending) {
         inFlight.add(event.event_id);
         deliveryAttempts.set(event.event_id, (deliveryAttempts.get(event.event_id) ?? 0) + 1);
       }

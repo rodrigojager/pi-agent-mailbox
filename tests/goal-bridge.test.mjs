@@ -80,6 +80,84 @@ test('real pi-goal goal_wait arms the mailbox bridge and one completion wakes th
   }
 });
 
+test('user input during a mailbox goal wait resumes the goal without losing the later child result', {
+  skip: (!existsSync(goalSource) || !existsSync(mockSource)) && 'Run beside a pi-goal source checkout',
+  timeout: 90000,
+}, async () => {
+  const baseDir = mkdtempSync(join(tmpdir(), 'pi-mailbox-goal-test-'));
+  const target = resolve(baseDir);
+  const sessionId = randomUUID();
+  const workflowId = randomUUID();
+  const settingsPath = join(baseDir, 'goal-settings.json');
+  writeFileSync(settingsPath, '{}\n');
+  let supervisor;
+  try {
+    const [{ default: goal }, { createMockPi, createMockContext }, { default: mailbox }] = await Promise.all([
+      jiti.import(goalSource), jiti.import(mockSource), jiti.import('../src/index.ts'),
+    ]);
+    ensureToken(sessionId, baseDir);
+    supervisor = createSupervisor({ sessionId, baseDir });
+    await supervisor.listen();
+    const mock = createMockPi();
+    const branch = () => mock.entries.map((entry, index) => ({ ...entry, type: 'custom', id: `entry-${index}` }));
+    const context = createMockContext({ sessionManager: {
+      getSessionId: () => sessionId, getBranch: branch, getEntries: branch,
+      getLeafId: () => branch().at(-1)?.id ?? null, getSessionFile: () => null,
+    } });
+    goal(mock.pi, { settingsPath });
+    mailbox(mock.pi, { baseDir });
+    mock.pi.setActiveTools(['goal_complete', 'goal_blocked', 'goal_wait']);
+    mock.pi.appendEntry('mailbox-workflow', { id: workflowId, sessionId });
+    for (const handler of mock.events.get('session_start') ?? []) await handler({}, context.ctx);
+    await mock.commands.get('goal').handler('Finish after the offline child', context.ctx);
+    const goalId = branch().findLast(entry => entry.customType === 'goal-state')?.data?.goal?.id;
+    assert.ok(goalId);
+    const jobId = randomUUID();
+    supervisor.store.registerJob({ jobId, coordinatorId: sessionId, workflowId, goalId });
+    const wait = await mock.tools.find(tool => tool.name === 'goal_wait').execute('goal-input-test', {
+      goal_id: goalId, reason: 'Waiting for the offline child',
+      subagents: { job_ids: [jobId], mode: 'all' },
+    }, new AbortController().signal, () => undefined, context.ctx);
+    assert.equal(wait.terminate, true);
+    const waitId = branch().findLast(entry => entry.customType === 'mailbox-goal-wait')?.data?.waitId;
+    assert.ok(waitId);
+    for (const handler of mock.events.get('agent_settled') ?? []) await handler({}, context.ctx);
+    assert.equal(supervisor.store.getWait(waitId).state, 'armed');
+
+    for (const handler of mock.events.get('input') ?? []) {
+      await handler({ source: 'interactive', text: 'Confira a situação enquanto o filho trabalha.' }, context.ctx);
+    }
+    const resumedGoal = branch().findLast(entry => entry.customType === 'goal-state')?.data?.goal;
+    assert.equal(resumedGoal?.id, goalId);
+    assert.equal(resumedGoal?.status, 'active');
+    assert.equal(resumedGoal?.waiting, undefined);
+    assert.equal(mock.sentMessages.filter(item => item.message?.customType === 'subagent-result').length, 0);
+    assert.equal(supervisor.store.getJob(jobId).state, 'registered');
+
+    supervisor.publish({ eventId: 'result-after-user-input', jobId, eventType: 'terminal',
+      executionState: 'succeeded', payload: { summary: 'offline child finished after user input' } });
+    const deadline = Date.now() + 5000;
+    while (mock.sentMessages.filter(item => item.message?.customType === 'subagent-result').length < 1 && Date.now() < deadline) {
+      await new Promise(resolve => setTimeout(resolve, 10));
+    }
+    const results = mock.sentMessages.filter(item => item.message?.customType === 'subagent-result');
+    assert.equal(results.length, 1);
+    assert.equal(results[0].options?.triggerTurn, true);
+    assert.match(results[0].message.content, /finished after user input/);
+    assert.equal(supervisor.store.getWait(waitId).state, 'cancelled', JSON.stringify({
+      resultDetails: results[0].message.details,
+      latestGoal: branch().findLast(entry => entry.customType === 'goal-state')?.data?.goal,
+      wait: supervisor.store.getWait(waitId),
+    }));
+    for (const handler of mock.events.get('session_shutdown') ?? []) await handler({}, context.ctx);
+  } finally {
+    await supervisor?.close();
+    if (!target.startsWith(resolve(tmpdir()) + '\\') && !target.startsWith(resolve(tmpdir()) + '/')) throw new Error('Refusing to delete outside temp');
+    if (!basename(target).startsWith('pi-mailbox-goal-test-')) throw new Error('Unexpected fixture name');
+    rmSync(target, { recursive: true, force: true });
+  }
+});
+
 test('real /goal pause and resume do not wake a newer goal with old mailbox results', {
   skip: (!existsSync(goalSource) || !existsSync(mockSource)) && 'Run beside a pi-goal source checkout',
   timeout: 90000,
