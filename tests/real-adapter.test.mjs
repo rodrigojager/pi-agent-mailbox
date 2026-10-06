@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync } from 'node:fs';
+import { spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join, resolve, basename } from 'node:path';
 import { randomUUID } from 'node:crypto';
@@ -88,6 +89,94 @@ test('real pi-subagent adapter launches the supplied Pi CLI entrypoint and retur
     else process.env.PI_CODING_AGENT_DIR = oldAgentDir;
     if (!target.startsWith(resolve(tmpdir()) + '\\') && !target.startsWith(resolve(tmpdir()) + '/')) throw new Error('Refusing to delete outside temp');
     if (!basename(target).startsWith('pi-mailbox-adapter-test-')) throw new Error('Unexpected fixture name');
+    rmSync(target, { recursive: true, force: true });
+  }
+});
+
+test('cancelling a real adapter terminates its nested mailbox process tree on Windows', {
+  skip: process.platform !== 'win32' || (!existsSync(adapterPath) && 'Requires a pi-subagent checkout'),
+  timeout: 90000,
+}, async () => {
+  const baseDir = mkdtempSync(join(tmpdir(), 'pi-mailbox-nested-test-'));
+  const target = resolve(baseDir);
+  const sessionId = randomUUID();
+  const jobId = randomUUID();
+  const oldAgentDir = process.env.PI_CODING_AGENT_DIR;
+  const agentDir = join(baseDir, 'pi-agent');
+  mkdirSync(agentDir);
+  process.env.PI_CODING_AGENT_DIR = agentDir;
+  let supervisor;
+  let client;
+  let nested;
+  const isAlive = pid => {
+    try { process.kill(pid, 0); return true; }
+    catch (error) { if (error.code === 'ESRCH') return false; throw error; }
+  };
+  try {
+    const token = ensureToken(sessionId, baseDir);
+    supervisor = createSupervisor({ sessionId, baseDir });
+    await supervisor.listen();
+    client = await MailboxClient.connect({ sessionId, baseDir, token });
+    const nestedPi = fileURLToPath(new URL('./fake-nested-pi.mjs', import.meta.url));
+    const job = {
+      jobId, coordinatorId: sessionId, workflowId: 'nested-root', depth: 0,
+      cwd: baseDir, instanceName: 'nested fixture #1', task: 'Run nested fixture',
+      agent: {
+        name: 'fixture', description: 'Offline nested child', systemPrompt: 'Complete the task.',
+        source: 'user', filePath: join(baseDir, 'fixture.md'), provider: 'fixture',
+        model: 'fixture-model', thinking: 'off', tools: ['complete'], skills: false, extensions: [],
+      },
+      role: { requested: { kind: 'none' }, origin: 'invocation', status: 'none' },
+      agentScope: 'user', projectAgentsDir: null,
+      parentModel: { provider: 'fixture', id: 'fixture-model' }, parentThinking: 'off',
+      debug: false, piInvocation: { command: process.execPath, args: [nestedPi] },
+    };
+    await client.request('start', { job, adapterPath });
+    const activityFile = join(baseDir, 'nested-activity.json');
+    const deadline = Date.now() + 35000;
+    while (!existsSync(activityFile) && Date.now() < deadline) {
+      const state = await client.request('job', { jobId });
+      assert.ok(!['failed', 'cancelled', 'unknown'].includes(state.state), `Root failed before nesting: ${state.state}`);
+      await new Promise(resolve => setTimeout(resolve, 100));
+    }
+    assert.ok(existsSync(activityFile), 'Nested mailbox did not become ready');
+    nested = JSON.parse(readFileSync(activityFile, 'utf8'));
+    for (const pid of [nested.piPid, nested.supervisorPid, nested.workerPid]) {
+      assert.ok(Number.isSafeInteger(pid) && pid > 0 && isAlive(pid), `Invalid live fixture PID: ${pid}`);
+    }
+    const terminal = new Promise((resolveEvent, reject) => {
+      const timer = setTimeout(() => reject(new Error('Root cancellation did not finish')), 30000);
+      client.subscribe(0, event => {
+        if (event.job_id === jobId && event.event_type === 'terminal') {
+          clearTimeout(timer);
+          resolveEvent(event);
+        }
+      }).catch(reject);
+    });
+    await client.request('cancel', { jobId });
+    const event = await terminal;
+    assert.equal(event.payload.state, 'cancelled');
+    const exitDeadline = Date.now() + 5000;
+    while ([nested.piPid, nested.supervisorPid, nested.workerPid].some(isAlive) && Date.now() < exitDeadline) {
+      await new Promise(resolve => setTimeout(resolve, 100));
+    }
+    assert.deepEqual([nested.piPid, nested.supervisorPid, nested.workerPid].filter(isAlive), [],
+      'Cancellation left a nested Pi process, supervisor or worker alive');
+  } finally {
+    if (client) {
+      try { await client.request('cancel', { jobId }); } catch { /* Already terminal. */ }
+      client.close();
+    }
+    await supervisor?.close();
+    if (nested) for (const pid of [nested.piPid, nested.supervisorPid, nested.workerPid]) {
+      if (Number.isSafeInteger(pid) && pid > 0 && isAlive(pid)) {
+        spawnSync('taskkill', ['/PID', String(pid), '/T', '/F'], { windowsHide: true, stdio: 'ignore' });
+      }
+    }
+    if (oldAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+    else process.env.PI_CODING_AGENT_DIR = oldAgentDir;
+    if (!target.startsWith(resolve(tmpdir()) + '\\') && !target.startsWith(resolve(tmpdir()) + '/')) throw new Error('Refusing to delete outside temp');
+    if (!basename(target).startsWith('pi-mailbox-nested-test-')) throw new Error('Unexpected fixture name');
     rmSync(target, { recursive: true, force: true });
   }
 });

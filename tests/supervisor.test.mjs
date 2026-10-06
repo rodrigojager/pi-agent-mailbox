@@ -245,6 +245,57 @@ test('a claimed start survives restart without a second execution', async () => 
   }
 });
 
+test('reboot recovery does not trust a reused worker PID or relaunch its job', async () => {
+  const f = fixture();
+  const dummy = spawn(process.execPath, ['-e', 'setTimeout(() => process.exit(0), 20000)'], {
+    stdio: 'ignore', windowsHide: true,
+  });
+  let supervisor;
+  let client;
+  try {
+    assert.ok(Number.isSafeInteger(dummy.pid) && dummy.pid > 0);
+    const token = ensureToken(f.sessionId, f.baseDir);
+    const journal = join(statePath(f.baseDir, f.sessionId), 'journal.sqlite');
+    const store = new MailboxStore(journal);
+    const job = { jobId: 'reused-pid-job', coordinatorId: 'root', workflowId: 'flow' };
+    store.registerJob(job);
+    assert.equal(store.claimStart(job.jobId), true);
+    store.recordWorker(job.jobId, dummy.pid);
+    store.publish({ eventId: 'old-worker-started', jobId: job.jobId,
+      eventType: 'started', executionState: 'running', payload: { workerPid: dummy.pid } });
+    store.close();
+
+    supervisor = createSupervisor(f);
+    await supervisor.listen();
+    client = await MailboxClient.connect({ ...f, token });
+    assert.equal((await client.request('job', { jobId: job.jobId })).state, 'unknown');
+    assert.equal((await client.request('events', { after: 0 })).filter(event =>
+      event.event_type === 'supervision_lost').length, 1);
+    const adapterPath = fileURLToPath(new URL('./fake-adapter.mjs', import.meta.url));
+    assert.equal((await client.request('start', { job, adapterPath })).duplicate, true);
+    assert.equal(dummy.exitCode, null, 'recovery must not signal the process occupying a stale PID');
+
+    client.close();
+    client = undefined;
+    await supervisor.close();
+    supervisor = createSupervisor(f);
+    await supervisor.listen();
+    client = await MailboxClient.connect({ ...f, token });
+    assert.equal((await client.request('job', { jobId: job.jobId })).state, 'unknown');
+    assert.equal((await client.request('events', { after: 0 })).filter(event =>
+      event.event_type === 'supervision_lost').length, 1);
+    assert.equal(dummy.exitCode, null);
+  } finally {
+    client?.close();
+    await supervisor?.close();
+    if (dummy.exitCode === null) {
+      dummy.kill();
+      await new Promise(resolveExit => dummy.once('exit', resolveExit));
+    }
+    f.cleanup();
+  }
+});
+
 test('a committed worker artifact is recovered after supervisor loss without relaunching the job', async () => {
   const f = fixture();
   let supervisor;

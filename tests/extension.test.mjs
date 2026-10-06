@@ -296,3 +296,73 @@ test('goal all wait stays quiet on partial completion and sends one grouped resu
     rmSync(target, { recursive: true, force: true });
   }
 });
+
+test('stopped and completed goals record late results without waking the model', async () => {
+  for (const status of ['paused', 'blocked', 'usage_limited', 'budget_limited', 'complete']) {
+    const baseDir = mkdtempSync(join(tmpdir(), 'pi-mailbox-extension-test-'));
+    const target = resolve(baseDir);
+    const sessionId = randomUUID();
+    const workflowId = randomUUID();
+    const goalId = randomUUID();
+    const jobId = `late-${status}`;
+    const branch = [
+      { id: 'workflow-marker', type: 'custom', customType: 'mailbox-workflow', data: { id: workflowId, sessionId } },
+      { id: 'goal-active', type: 'custom', customType: 'goal-state', data: { goal: { id: goalId, status: 'active', waiting: { reason: 'child' } } } },
+    ];
+    let supervisor;
+    let client;
+    try {
+      ensureToken(sessionId, baseDir);
+      supervisor = createSupervisor({ sessionId, baseDir });
+      await supervisor.listen();
+      client = await MailboxClient.connect({ sessionId, baseDir, token: ensureToken(sessionId, baseDir) });
+      await client.request('register', { job: { jobId, coordinatorId: sessionId, workflowId, goalId } });
+      client.close();
+      client = undefined;
+      await until(() => !supervisor.ownerPresent());
+      const handlers = new Map();
+      const sent = [];
+      const ctx = {
+        hasUI: false,
+        ui: { setStatus() {}, notify() {} },
+        sessionManager: { getSessionId: () => sessionId, getBranch: () => branch },
+      };
+      const pi = {
+        events: new EventEmitter(),
+        on(name, handler) { handlers.set(name, [...(handlers.get(name) ?? []), handler]); },
+        appendEntry(customType, data) { branch.push({ id: randomUUID(), type: 'custom', customType, data }); },
+        sendMessage(message, options) { sent.push({ message, options }); },
+        registerCommand() {}, registerTool() {},
+      };
+      registerAgentMailbox(pi, { baseDir });
+      let bridge;
+      pi.events.emit('pi:agent-job-wait:v1', { context: ctx, accept: value => { bridge = value; } });
+      const armed = await bridge.arm({ goalId, jobIds: [jobId], mode: 'all' });
+      assert.equal(armed.ready, false, status);
+      bridge.commit(armed.waitId);
+      branch.push({ id: `goal-${status}`, type: 'custom', customType: 'goal-state', data: { goal: { id: goalId, status } } });
+      supervisor.publish({ eventId: `result-${status}`, jobId,
+        eventType: 'terminal', executionState: 'succeeded', payload: { summary: `late ${status} result` } });
+      await until(() => sent.length === 1);
+      assert.equal(sent[0].options.triggerTurn, false, status);
+      assert.match(sent[0].message.content, new RegExp(`late ${status} result`));
+      await until(() => supervisor.store.db.prepare('SELECT state FROM waits WHERE wait_id=?').get(armed.waitId)?.state === 'cancelled');
+      branch.push({ id: `history-${status}`, type: 'custom_message', customType: 'subagent-result', details: sent[0].message.details });
+      for (const handler of handlers.get('message_end') ?? []) handler({}, ctx);
+      await until(() => supervisor.store.db.prepare('SELECT state FROM deliveries WHERE event_id=?').get(`result-${status}`)?.state === 'recorded');
+      if (status !== 'complete') {
+        branch.push({ id: `resume-${status}`, type: 'custom', customType: 'goal-state', data: { goal: { id: goalId, status: 'active' } } });
+        for (const handler of handlers.get('session_tree') ?? []) handler({ oldLeafId: null, newLeafId: null }, ctx);
+        await new Promise(resolve => setTimeout(resolve, 20));
+        assert.equal(sent.length, 1, `resume from ${status} must not duplicate a recorded result`);
+      }
+      for (const handler of handlers.get('session_shutdown') ?? []) handler({}, ctx);
+    } finally {
+      client?.close();
+      await supervisor?.close();
+      if (!target.startsWith(resolve(tmpdir()) + '\\') && !target.startsWith(resolve(tmpdir()) + '/')) throw new Error('Refusing to delete outside temp');
+      if (!basename(target).startsWith('pi-mailbox-extension-test-')) throw new Error('Unexpected fixture name');
+      rmSync(target, { recursive: true, force: true });
+    }
+  }
+});
