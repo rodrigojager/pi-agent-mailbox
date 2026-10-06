@@ -93,8 +93,8 @@ test('real pi-subagent adapter launches the supplied Pi CLI entrypoint and retur
   }
 });
 
-test('cancelling a real adapter terminates its nested mailbox process tree on Windows', {
-  skip: process.platform !== 'win32' || (!existsSync(adapterPath) && 'Requires a pi-subagent checkout'),
+test('cancelling a real adapter terminates its nested mailbox process tree', {
+  skip: !existsSync(adapterPath) && 'Requires a pi-subagent checkout',
   timeout: 90000,
 }, async () => {
   const baseDir = mkdtempSync(join(tmpdir(), 'pi-mailbox-nested-test-'));
@@ -109,6 +109,12 @@ test('cancelling a real adapter terminates its nested mailbox process tree on Wi
   let client;
   let nested;
   const isAlive = pid => {
+    if (process.platform === 'linux') {
+      try {
+        const stat = readFileSync(`/proc/${pid}/stat`, 'utf8');
+        if (/^\s*Z\s/.test(stat.slice(stat.lastIndexOf(')') + 1))) return false;
+      } catch (error) { if (error.code === 'ENOENT') return false; throw error; }
+    }
     try { process.kill(pid, 0); return true; }
     catch (error) { if (error.code === 'ESRCH') return false; throw error; }
   };
@@ -170,7 +176,11 @@ test('cancelling a real adapter terminates its nested mailbox process tree on Wi
     await supervisor?.close();
     if (nested) for (const pid of [nested.piPid, nested.supervisorPid, nested.workerPid]) {
       if (Number.isSafeInteger(pid) && pid > 0 && isAlive(pid)) {
-        spawnSync('taskkill', ['/PID', String(pid), '/T', '/F'], { windowsHide: true, stdio: 'ignore' });
+        if (process.platform === 'win32') {
+          spawnSync('taskkill', ['/PID', String(pid), '/T', '/F'], { windowsHide: true, stdio: 'ignore' });
+        } else {
+          process.kill(pid, 'SIGKILL');
+        }
       }
     }
     if (oldAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;

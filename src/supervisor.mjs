@@ -6,6 +6,7 @@ import { fork } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { endpointFor, encodeFrame, createFrameParser, PROTOCOL_VERSION, statePath } from './protocol.mjs';
 import { MailboxStore } from './store.mjs';
+import { detachMailboxProcess } from './process-group.mjs';
 
 const MAX_SOCKET_BACKLOG_BYTES = 4 * 1024 * 1024;
 const DROP_EPHEMERAL_AT_BYTES = 512 * 1024;
@@ -212,7 +213,7 @@ export function createSupervisor({ sessionId, baseDir, idleTimeoutMs = 60000, st
     let worker;
     try {
       worker = fork(workerPath, [], {
-        detached: true,
+        detached: detachMailboxProcess(),
         stdio: ['ignore', 'ignore', 'ignore', 'ipc'],
         windowsHide: true,
         env: { ...process.env, ...(job.depth !== undefined ? { PI_SUBAGENT_DEPTH: String(job.depth) } : {}) },

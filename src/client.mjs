@@ -5,6 +5,7 @@ import { randomBytes } from 'node:crypto';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createFrameParser, encodeFrame, endpointFor, PROTOCOL_VERSION, statePath } from './protocol.mjs';
+import { detachMailboxProcess } from './process-group.mjs';
 
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 
@@ -160,7 +161,7 @@ export async function connectOrStartSupervisor({ sessionId, baseDir, startupTime
   }
   const supervisorPath = fileURLToPath(new URL('./supervisor.mjs', import.meta.url));
   const child = spawn(process.execPath, [supervisorPath, sessionId, baseDir], {
-    detached: true,
+    detached: detachMailboxProcess(),
     stdio: 'ignore',
     windowsHide: true,
   });
