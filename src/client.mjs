@@ -107,7 +107,7 @@ export class MailboxClient {
       listener(event);
     };
     const receive = event => {
-      if (replaying) buffered.push(event);
+      if (replaying && Number.isSafeInteger(event?.seq)) buffered.push(event);
       else deliver(event);
     };
     this.listeners.add(receive);
@@ -123,6 +123,7 @@ export class MailboxClient {
         replay = await this.request('events', { after: cursor, limit: 1000 });
       }
       replaying = false;
+      buffered.sort((left, right) => left.seq - right.seq);
       for (const event of buffered) deliver(event);
     } catch (error) {
       this.listeners.delete(receive);

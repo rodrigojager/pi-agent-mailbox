@@ -58,10 +58,10 @@ export function createSupervisor({ sessionId, baseDir, idleTimeoutMs = 60000, st
     idleTimer = undefined;
   };
   const scheduleIdle = () => {
-    if (!onIdle || closed || sockets.size || workers.size || idleTimer) return;
+    if (!onIdle || closed || sockets.size || workers.size || maintenanceContinuation || idleTimer) return;
     idleTimer = setTimeout(() => {
       idleTimer = undefined;
-      if (!closed && sockets.size === 0 && workers.size === 0) onIdle();
+      if (!closed && sockets.size === 0 && workers.size === 0 && !maintenanceContinuation) onIdle();
     }, idleTimeoutMs);
   };
   const heartbeat = setInterval(() => {
@@ -134,6 +134,8 @@ export function createSupervisor({ sessionId, baseDir, idleTimeoutMs = 60000, st
       } else {
         maintenanceWarning = error instanceof Error ? error.message : String(error);
       }
+    } finally {
+      if (continuing && !maintenanceContinuation) scheduleIdle();
     }
   }
 

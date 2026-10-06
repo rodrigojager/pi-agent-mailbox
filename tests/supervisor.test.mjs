@@ -59,6 +59,18 @@ test('terminal event and pending delivery survive a supervisor restart', async (
     const db = new MailboxStore(join(statePath(f.baseDir, f.sessionId), 'journal.sqlite'));
     assert.equal(db.db.prepare('SELECT entry_id FROM deliveries WHERE event_id=?').get('event-1').entry_id, 'entry-7');
     db.close();
+    supervisor = createSupervisor(f);
+    try {
+      await supervisor.listen();
+      client = await MailboxClient.connect({ ...f, token });
+      assert.deepEqual((await client.request('events', { after: 0 })).map(item => item.event_id), ['event-1']);
+      assert.equal(supervisor.store.db.prepare('SELECT state FROM deliveries WHERE event_id=?').get('event-1').state,
+        'recorded', 'ACK must survive a second restart');
+      assert.equal(supervisor.store.db.prepare("SELECT COUNT(*) AS n FROM deliveries WHERE state='pending'").get().n, 0);
+    } finally {
+      client?.close();
+      await supervisor.close();
+    }
   } finally { f.cleanup(); }
 });
 

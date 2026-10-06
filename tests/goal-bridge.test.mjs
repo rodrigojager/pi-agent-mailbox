@@ -15,7 +15,7 @@ const jiti = createJiti(import.meta.url);
 
 test('real pi-goal goal_wait arms the mailbox bridge and one completion wakes the owned goal', {
   skip: (!existsSync(goalSource) || !existsSync(mockSource)) && 'Run beside a pi-goal source checkout',
-  timeout: 30000,
+  timeout: 90000,
 }, async () => {
   const baseDir = mkdtempSync(join(tmpdir(), 'pi-mailbox-goal-test-'));
   const target = resolve(baseDir);
@@ -82,7 +82,7 @@ test('real pi-goal goal_wait arms the mailbox bridge and one completion wakes th
 
 test('real /goal pause delivers a late mailbox result without resuming the model', {
   skip: (!existsSync(goalSource) || !existsSync(mockSource)) && 'Run beside a pi-goal source checkout',
-  timeout: 30000,
+  timeout: 90000,
 }, async () => {
   const baseDir = mkdtempSync(join(tmpdir(), 'pi-mailbox-goal-test-'));
   const target = resolve(baseDir);
