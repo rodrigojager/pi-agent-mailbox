@@ -157,3 +157,77 @@ test('real /goal pause and resume do not wake a newer goal with old mailbox resu
     rmSync(target, { recursive: true, force: true });
   }
 });
+
+for (const transition of ['complete', 'blocked']) {
+  test(`real pi-goal ${transition} keeps a late mailbox result from waking the model`, {
+    skip: (!existsSync(goalSource) || !existsSync(mockSource)) && 'Run beside a pi-goal source checkout',
+    timeout: 90000,
+  }, async () => {
+    const baseDir = mkdtempSync(join(tmpdir(), 'pi-mailbox-goal-test-'));
+    const target = resolve(baseDir);
+    const sessionId = randomUUID();
+    const workflowId = randomUUID();
+    const settingsPath = join(baseDir, 'goal-settings.json');
+    writeFileSync(settingsPath, '{}\n');
+    let supervisor;
+    try {
+      const [{ default: goal }, { createMockPi, createMockContext }, { default: mailbox }] = await Promise.all([
+        jiti.import(goalSource), jiti.import(mockSource), jiti.import('../src/index.ts'),
+      ]);
+      ensureToken(sessionId, baseDir);
+      supervisor = createSupervisor({ sessionId, baseDir });
+      await supervisor.listen();
+      const mock = createMockPi();
+      const branch = () => mock.entries.map((entry, index) => ({ ...entry, type: 'custom', id: `entry-${index}` }));
+      const context = createMockContext({
+        sessionManager: {
+          getSessionId: () => sessionId, getBranch: branch, getEntries: branch,
+          getLeafId: () => branch().at(-1)?.id ?? null, getSessionFile: () => null,
+        },
+      });
+      goal(mock.pi, { settingsPath });
+      mailbox(mock.pi, { baseDir });
+      mock.pi.setActiveTools(['goal_complete', 'goal_blocked', 'goal_wait']);
+      mock.pi.appendEntry('mailbox-workflow', { id: workflowId, sessionId });
+      for (const handler of mock.events.get('session_start') ?? []) await handler({}, context.ctx);
+      await mock.commands.get('goal').handler(`Verify ${transition} fixture`, context.ctx);
+      const goalId = branch().findLast(entry => entry.customType === 'goal-state')?.data?.goal?.id;
+      assert.ok(goalId);
+      const jobId = randomUUID();
+      supervisor.store.registerJob({ jobId, coordinatorId: sessionId, workflowId, goalId });
+      const wait = await mock.tools.find(tool => tool.name === 'goal_wait').execute('goal-terminal-test', {
+        goal_id: goalId, reason: 'Waiting for the offline child',
+        subagents: { job_ids: [jobId], mode: 'all' },
+      }, new AbortController().signal, () => undefined, context.ctx);
+      assert.equal(wait.terminate, true);
+      const params = transition === 'complete'
+        ? { goal_id: goalId, summary: 'The monitored work is complete and verified.' }
+        : {
+            goal_id: goalId,
+            reason: 'External system permanently rejected access',
+            evidence: 'The same rejection was verified in three separate goal turns.',
+            repeated_turns: 3,
+          };
+      const result = await mock.tools.find(tool => tool.name === `goal_${transition}`).execute(
+        `goal-${transition}-test`, params, new AbortController().signal, () => undefined, context.ctx,
+      );
+      assert.equal(result.terminate, true, JSON.stringify(result));
+      supervisor.publish({ eventId: `late-${transition}-result`, jobId, eventType: 'terminal',
+        executionState: 'succeeded', payload: { summary: `child finished after ${transition}` } });
+      const deadline = Date.now() + 5000;
+      while (!mock.sentMessages.some(item => item.message?.customType === 'subagent-result') && Date.now() < deadline) {
+        await new Promise(resolve => setTimeout(resolve, 10));
+      }
+      const delivered = mock.sentMessages.filter(item => item.message?.customType === 'subagent-result');
+      assert.equal(delivered.length, 1);
+      assert.equal(delivered[0].options?.triggerTurn, false);
+      assert.match(delivered[0].message.content, new RegExp(`finished after ${transition}`));
+      for (const handler of mock.events.get('session_shutdown') ?? []) await handler({}, context.ctx);
+    } finally {
+      await supervisor?.close();
+      if (!target.startsWith(resolve(tmpdir()) + '\\') && !target.startsWith(resolve(tmpdir()) + '/')) throw new Error('Refusing to delete outside temp');
+      if (!basename(target).startsWith('pi-mailbox-goal-test-')) throw new Error('Unexpected fixture name');
+      rmSync(target, { recursive: true, force: true });
+    }
+  });
+}
