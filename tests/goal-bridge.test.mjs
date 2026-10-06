@@ -124,8 +124,9 @@ test('user input during a mailbox goal wait resumes the goal without losing the 
     for (const handler of mock.events.get('agent_settled') ?? []) await handler({}, context.ctx);
     assert.equal(supervisor.store.getWait(waitId).state, 'armed');
 
+    const inputContext = { ...context.ctx };
     for (const handler of mock.events.get('input') ?? []) {
-      await handler({ source: 'interactive', text: 'Confira a situação enquanto o filho trabalha.' }, context.ctx);
+      await handler({ source: 'interactive', text: 'Confira a situação enquanto o filho trabalha.' }, inputContext);
     }
     const resumedGoal = branch().findLast(entry => entry.customType === 'goal-state')?.data?.goal;
     assert.equal(resumedGoal?.id, goalId);
@@ -133,6 +134,12 @@ test('user input during a mailbox goal wait resumes the goal without losing the 
     assert.equal(resumedGoal?.waiting, undefined);
     assert.equal(mock.sentMessages.filter(item => item.message?.customType === 'subagent-result').length, 0);
     assert.equal(supervisor.store.getJob(jobId).state, 'registered');
+    const cancelDeadline = Date.now() + 5000;
+    while (supervisor.store.getWait(waitId).state !== 'cancelled' && Date.now() < cancelDeadline) {
+      await new Promise(resolve => setTimeout(resolve, 10));
+    }
+    assert.equal(supervisor.store.getWait(waitId).state, 'cancelled',
+      'user input should release the old goal wait before the child completes');
 
     supervisor.publish({ eventId: 'result-after-user-input', jobId, eventType: 'terminal',
       executionState: 'succeeded', payload: { summary: 'offline child finished after user input' } });

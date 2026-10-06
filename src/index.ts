@@ -502,6 +502,16 @@ export default function registerAgentMailbox(pi: ExtensionAPI, options: { baseDi
     const filename = join(statePath(baseDir, ctx.sessionManager.getSessionId()), 'journal.sqlite');
     if (existsSync(filename)) void connectFor(ctx).catch(() => {});
   });
+  pi.on('input', (_event, ctx) => {
+    const binding = goalBinding;
+    if (!binding) return;
+    currentContext = ctx;
+    // Run after other input handlers have had a chance to clear goal_wait.
+    setImmediate(() => {
+      if (goalBinding !== binding || currentContext?.sessionManager.getSessionId() !== binding.sessionId) return;
+      void flushGoalWait().catch(error => ctx.ui?.notify(`Mailbox wait error: ${error}`, 'error'));
+    });
+  });
   pi.on('session_before_switch', () => { disconnect(); currentContext = undefined; });
   pi.on('session_shutdown', () => { disconnect(); currentContext = undefined; });
   pi.on('session_tree', (event, ctx) => {

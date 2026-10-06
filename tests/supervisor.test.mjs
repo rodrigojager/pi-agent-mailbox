@@ -101,6 +101,44 @@ test('a supervisor crash after SQLite commit but before IPC notification replays
   }
 });
 
+test('a job registered before an abrupt supervisor exit can start once after recovery', async () => {
+  const f = fixture();
+  let supervisor;
+  let client;
+  try {
+    const token = ensureToken(f.sessionId, f.baseDir);
+    const crashFixture = fileURLToPath(new URL('./fake-register-crash.mjs', import.meta.url));
+    const crashed = spawnSync(process.execPath, [crashFixture, f.sessionId, f.baseDir], {
+      windowsHide: true, timeout: 10000, encoding: 'utf8',
+    });
+    assert.equal(crashed.status, 9, crashed.stderr);
+    supervisor = createSupervisor(f);
+    await supervisor.listen();
+    client = await MailboxClient.connect({ ...f, token });
+    assert.equal((await client.request('job', { jobId: 'registered-before-crash' })).state, 'registered');
+    const job = { jobId: 'registered-before-crash', coordinatorId: 'root', workflowId: 'flow' };
+    const adapterPath = fileURLToPath(new URL('./fake-adapter.mjs', import.meta.url));
+    const final = new Promise((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error('Recovered job did not finish')), 8000);
+      client.subscribe(0, event => {
+        if (event.event_type !== 'terminal') return;
+        clearTimeout(timer);
+        resolve(event);
+      }).catch(reject);
+    });
+    assert.equal((await client.request('start', { job, adapterPath })).duplicate, false);
+    const terminal = await final;
+    assert.equal(terminal.payload.summary, 'finished registered-before-crash');
+    assert.equal((await client.request('start', { job, adapterPath })).duplicate, true);
+    const events = await client.request('events', { after: 0 });
+    assert.equal(events.filter(event => event.event_type === 'terminal').length, 1);
+  } finally {
+    client?.close();
+    await supervisor?.close();
+    f.cleanup();
+  }
+});
+
 test('Unix stale endpoint recovery leaves a live supervisor and non-socket files intact', {
   skip: process.platform === 'win32',
 }, async () => {

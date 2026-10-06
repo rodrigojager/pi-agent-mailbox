@@ -226,7 +226,8 @@ export function createSupervisor({ sessionId, baseDir, idleTimeoutMs = 60000, st
     for (const job of store.openJobs()) {
       reconcileArtifact(job.job_id);
       const current = store.getJob(job.job_id);
-      if (current && current.state !== 'unknown' && !['succeeded', 'failed', 'cancelled'].includes(current.state)) {
+      // A registered job has not claimed execution yet and can safely start after recovery.
+      if (current && !['registered', 'unknown', 'succeeded', 'failed', 'cancelled'].includes(current.state)) {
         publishAndNotify({
           eventId: `supervision-lost:${job.job_id}`,
           jobId: job.job_id,

@@ -13,7 +13,7 @@ if (useInstalledSettings && !installedRoot) throw new Error('PI_MAILBOX_INSTALL_
 const packages = installedRoot
   ? [
       `pi-agent-mailbox-v${version}/src/index.ts`,
-      'pi-subagent-v0.13.0-rodrigo.5/src/index.ts',
+      'pi-subagent-v0.13.0-rodrigo.6/src/index.ts',
       'pi-goal-v0.54.8-rodrigo.1/dist/index.ts',
       'pi-agent-switcher-v0.4.0-rodrigo.8/index.ts',
       'pi-goal-highlight-v1.1.2/index.ts',

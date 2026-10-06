@@ -28,7 +28,8 @@ The orchestrator can call `subagent_wait` with exact `job_ids`, `mode: any|all`,
 
 - A terminal result and its pending delivery are committed together. Replay and history-ID deduplication provide at-least-once delivery while the local journal and destination session survive. A transient ACK failure is retried without sending the recorded message again. An ACK means the result was recorded in Pi history, not that the model acted on it.
 - Navigating to a fork or an ancestor creates a separate workflow when it would otherwise inherit the same branch marker. Returning to a branch that already owns jobs preserves its workflow and replays its pending results.
-- A crash around child startup may leave the execution **unknown**. The same job is never relaunched automatically after an uncertain start. A late result artifact can reconcile that state.
+- A job left only `registered` by a crash has not claimed execution and can start after recovery. A crash after the durable start claim may leave execution **unknown**; the same job is never relaunched automatically then. A late result artifact can reconcile that state.
+- User input that clears an active `goal_wait` releases its wait registration without cancelling the child. Its later result can still be delivered to the active goal.
 - Heartbeats and lack-of-progress warnings update the UI without waking the model. Silence alone does not mark a child failed.
 - A slow client may miss ephemeral progress frames. Its socket backlog is capped at 4 MiB; reconnecting replays committed events, including every terminal result.
 - If a journal write fails, the supervisor reports storage unavailable and refuses new jobs until it is restarted after the storage problem is fixed. An already running worker can still leave an artifact for recovery; the coordinator never treats an uncommitted result as delivered.
