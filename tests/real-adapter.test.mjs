@@ -93,6 +93,75 @@ test('real pi-subagent adapter launches the supplied Pi CLI entrypoint and retur
   }
 });
 
+test('a nested child receives its grandchild result before returning one result to the root', {
+  skip: !existsSync(adapterPath) && 'Run beside a pi-subagent checkout to exercise the real adapter',
+  timeout: 90000,
+}, async () => {
+  const baseDir = mkdtempSync(join(tmpdir(), 'pi-mailbox-nested-success-test-'));
+  const target = resolve(baseDir);
+  const sessionId = randomUUID();
+  const oldAgentDir = process.env.PI_CODING_AGENT_DIR;
+  const agentDir = join(baseDir, 'pi-agent');
+  mkdirSync(agentDir);
+  process.env.PI_CODING_AGENT_DIR = agentDir;
+  let supervisor;
+  let client;
+  try {
+    const token = ensureToken(sessionId, baseDir);
+    supervisor = createSupervisor({ sessionId, baseDir });
+    await supervisor.listen();
+    client = await MailboxClient.connect({ sessionId, baseDir, token });
+    const jobId = randomUUID();
+    const nestedPi = fileURLToPath(new URL('./fake-nested-success-pi.mjs', import.meta.url));
+    const terminal = new Promise((resolveEvent, reject) => {
+      const timer = setTimeout(() => reject(new Error('Nested result did not reach the root')), 70000);
+      client.subscribe(0, event => {
+        if (event.job_id === jobId && event.event_type === 'terminal') {
+          clearTimeout(timer);
+          resolveEvent(event);
+        }
+      }).catch(reject);
+    });
+    await client.request('start', {
+      job: {
+        jobId, coordinatorId: sessionId, workflowId: 'nested-root', depth: 0,
+        cwd: baseDir, instanceName: 'nested success fixture #1', task: 'Return the nested result',
+        agent: {
+          name: 'fixture', description: 'Offline nested child', systemPrompt: 'Complete the task.',
+          source: 'user', filePath: join(baseDir, 'fixture.md'), provider: 'fixture',
+          model: 'fixture-model', thinking: 'off', tools: ['complete'], skills: false, extensions: [],
+        },
+        role: { requested: { kind: 'none' }, origin: 'invocation', status: 'none' },
+        agentScope: 'user', projectAgentsDir: null,
+        parentModel: { provider: 'fixture', id: 'fixture-model' }, parentThinking: 'off',
+        debug: false, piInvocation: { command: process.execPath, args: [nestedPi] },
+      }, adapterPath,
+    });
+    const event = await terminal;
+    assert.equal(event.payload.state, 'succeeded', JSON.stringify(event.payload));
+    const nested = JSON.parse(readFileSync(join(baseDir, 'nested-success.json'), 'utf8'));
+    assert.equal(nested.state, 'succeeded');
+    assert.equal(nested.depth, '1');
+    assert.equal(nested.summary, `finished ${nested.jobId}`);
+    assert.ok(nested.terminalEventId);
+    assert.notEqual(nested.sessionId, sessionId);
+    const artifact = JSON.parse(readFileSync(event.payload.resultRef, 'utf8'));
+    assert.match(artifact.summary, new RegExp(`child received grandchild ${nested.jobId}`));
+    assert.match(artifact.summary, new RegExp(`finished ${nested.jobId}`));
+    const rootEvents = await client.request('events', { after: 0, limit: 100 });
+    assert.equal(rootEvents.filter(candidate => candidate.job_id === jobId && candidate.event_type === 'terminal').length, 1);
+    assert.equal(rootEvents.filter(candidate => candidate.job_id === nested.jobId).length, 0);
+  } finally {
+    client?.close();
+    await supervisor?.close();
+    if (oldAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+    else process.env.PI_CODING_AGENT_DIR = oldAgentDir;
+    if (!target.startsWith(resolve(tmpdir()) + '\\') && !target.startsWith(resolve(tmpdir()) + '/')) throw new Error('Refusing to delete outside temp');
+    if (!basename(target).startsWith('pi-mailbox-nested-success-test-')) throw new Error('Unexpected fixture name');
+    rmSync(target, { recursive: true, force: true, maxRetries: 50, retryDelay: 100 });
+  }
+});
+
 test('cancelling a real adapter terminates its nested mailbox process tree', {
   skip: !existsSync(adapterPath) && 'Requires a pi-subagent checkout',
   timeout: 90000,
